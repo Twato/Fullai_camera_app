@@ -1,0 +1,3276 @@
+import os
+import json
+import threading
+from threading import Event
+from datetime import datetime
+from time import sleep
+import time
+import traceback
+import math
+import shutil
+import re
+
+import cv2
+import tkinter as tk
+from tkinter import messagebox
+from PIL import Image, ImageTk
+
+from config_test import (
+    CAPTURE_DIR,
+    ROI_DIR,
+    OCR_DIR,
+    PICAM1_INDEX,
+    PICAM2_INDEX,
+    USB_DEVICE,
+    PREVIEW_SIZE,
+    PREVIEW_INTERVAL,
+)
+
+from camera_test import PiCameraTest, UsbCameraTest
+from roi_test import crop_center, crop_by_box, preprocess_ocr, save_roi_files
+from ocr_test import run_easyocr, load_ocr
+
+os.makedirs(CAPTURE_DIR, exist_ok=True)
+os.makedirs(ROI_DIR, exist_ok=True)
+os.makedirs(OCR_DIR, exist_ok=True)
+
+# =========================================================
+# GLOBAL STATE
+# =========================================================
+running = False
+last_preview_time = 0
+current_camera = None
+
+# Action event is used for OK/NEXT, Restart The Process, Cancel Job.
+# action_value can be: None, "next", "restart", "cancel"
+action_event = Event()
+action_value = None
+
+debug_wait_counter = 0
+current_review_context = "-"
+current_screen_mode = "input"  # input, capture_inner, result_inner, capture_outer, result_outer, ready_toc, complete
+
+check_labels = {}
+capture_state_label = None
+capture_state_dot = None
+result_product_slots = {}
+
+# Job data
+en_no = ""
+delivery_no = ""
+item_no = "-"       # Test mode: placeholder. Future: from picking list.
+pack_type = "Tray"  # Fixed for this test UI.
+quantity = 0        # Inner Box total.
+current_index = 0   # Current Inner Box index.
+current_outer_index = 0
+outer_total = 0     # ceil(quantity / 6)
+inner_toa_lot_by_index = {}  # Backward-compatible cache: Inner Box no -> TOA Lot No OCR value
+
+# =========================================================
+# T9 INPUT / DEVICE SAFETY STATE
+# =========================================================
+USB_DEVICE_CANDIDATES = [0, 1, 16]
+resolved_usb_device = None
+last_input_validation = {}
+input_scan_logs = []
+scanner_test_window = None
+scanner_test_entry = None
+scanner_test_result_label = None
+scanner_test_detail_label = None
+
+
+# =========================================================
+# PHASE 2 DATA MODEL + STORAGE
+# Phase 3/4/5 (Database / API / Audit Search) are intentionally not connected yet.
+# =========================================================
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+STORAGE_ROOT = os.path.join(APP_DIR, "storage")
+
+job_id = ""
+job_started_at = ""
+job_storage_dir = ""
+job_data = {}
+
+# V2 Attempt Management
+delivery_storage_dir = ""
+attempt_storage_dir = ""
+attempt_no = 0
+attempt_status = ""
+process_attempt_counter = {}
+current_process_attempt_dir = ""
+current_process_attempt_meta = {}
+
+
+def clean_value(value, empty=""):
+    value = str(value or "").strip()
+    if value == "(empty)" or value == "-":
+        return empty
+    return value
+
+
+def normalize_key(value):
+    return clean_value(value, "UNKNOWN").replace(" ", "").replace("/", "_").replace("\\", "_").upper()
+
+
+def safe_folder_name(value, max_len=80):
+    value = normalize_key(value)
+    safe = []
+    for ch in value:
+        if ch.isalnum() or ch in ("_", "-", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    name = "".join(safe).strip("_") or "UNKNOWN"
+    return name[:max_len]
+
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def file_time_iso(path):
+    try:
+        if path and os.path.exists(path):
+            return datetime.fromtimestamp(os.path.getmtime(path)).isoformat(timespec="seconds")
+    except Exception:
+        pass
+    return ""
+
+
+def seconds_between(start_iso, end_iso=None):
+    try:
+        if not start_iso:
+            return None
+        end_iso = end_iso or now_iso()
+        start_dt = datetime.fromisoformat(str(start_iso))
+        end_dt = datetime.fromisoformat(str(end_iso))
+        return round((end_dt - start_dt).total_seconds(), 3)
+    except Exception:
+        return None
+
+
+def touch_dict_time(data, created_key="created_at"):
+    if isinstance(data, dict):
+        t = now_iso()
+        data.setdefault(created_key, t)
+        data["updated_at"] = t
+    return data
+
+
+def make_time_block(start_iso=None, end_iso=None):
+    start_iso = start_iso or now_iso()
+    end_iso = end_iso or ""
+    return {
+        "created_at": start_iso,
+        "start_time": start_iso,
+        "end_time": end_iso,
+        "duration_sec": seconds_between(start_iso, end_iso) if end_iso else None,
+    }
+
+
+def add_job_event(event, status="", detail=None):
+    if not job_data:
+        return
+    item = {
+        "time": now_iso(),
+        "event": event,
+    }
+    if status:
+        item["status"] = status
+    if detail:
+        item.update(detail)
+    job_data.setdefault("events", []).append(item)
+
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def copy_if_exists(src, dst_dir, new_name=None):
+    if not src or not os.path.exists(src):
+        return ""
+    ensure_dir(dst_dir)
+    filename = new_name or os.path.basename(src)
+    dst = os.path.join(dst_dir, filename)
+    try:
+        shutil.copy2(src, dst)
+        return dst
+    except Exception as e:
+        print("Storage copy error:", src, "->", dst, e)
+        return ""
+
+
+def make_job_id(delivery):
+    return datetime.now().strftime("JOB_%Y%m%d_%H%M%S_") + safe_folder_name(delivery, 40)
+
+
+
+def get_delivery_dir(delivery=None):
+    now = datetime.now()
+    delivery = delivery or delivery_no or "UNKNOWN"
+    return os.path.join(
+        STORAGE_ROOT,
+        now.strftime("%Y"),
+        now.strftime("%m"),
+        now.strftime("%d"),
+        f"DELIVERY_{safe_folder_name(delivery)}",
+    )
+
+
+def find_next_attempt_no(delivery_dir):
+    ensure_dir(delivery_dir)
+    max_no = 0
+    for name in os.listdir(delivery_dir):
+        if not name.startswith("attempt_"):
+            continue
+        parts = name.split("_")
+        if len(parts) >= 2 and parts[1].isdigit():
+            max_no = max(max_no, int(parts[1]))
+    return max_no + 1
+
+
+def attempt_folder_name(no, status):
+    return f"attempt_{no:03d}_{str(status or 'running').lower()}"
+
+
+def write_json_file(path, data):
+    ensure_dir(os.path.dirname(path))
+    if isinstance(data, dict):
+        # T7: every JSON saved by the system has updated_at/saved_at.
+        data.setdefault("created_at", now_iso())
+        data["updated_at"] = now_iso()
+        data["saved_at"] = now_iso()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+
+# =========================================================
+# GLOBAL SEARCH INDEX (T8)
+# Single search file for 90-day audit lookup.
+# Search keys:
+# - Delivery No
+# - Vendor BOX ID
+# - TOA LOT NO
+# - TOB LOT NO
+# - TOC Delivery No
+# - TOC LOT NO
+# =========================================================
+GLOBAL_SEARCH_INDEX_PATH = os.path.join(STORAGE_ROOT, "global_search_index.json")
+
+
+def rel_storage_path(path):
+    try:
+        if not path:
+            return ""
+        return os.path.relpath(path, STORAGE_ROOT).replace("\\", "/")
+    except Exception:
+        return str(path or "").replace("\\", "/")
+
+
+def read_json_safely(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def blank_global_index():
+    return {
+        "project": "AI-Based Validation System for Shipping Label Verification",
+        "index_version": "T8_SINGLE_GLOBAL_SEARCH_INDEX",
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "storage_root": STORAGE_ROOT,
+        "record_count": 0,
+        "delivery_nos": {},
+        "box_ids": {},
+        "toa_lots": {},
+        "tob_lots": {},
+        "toc_delivery_nos": {},
+        "toc_lots": {},
+    }
+
+
+def add_index_entry(index_data, section, key_value, entry):
+    key_value = clean_value(key_value, "")
+    if not key_value:
+        return
+    key = normalize_text_for_compare(key_value)
+    if not key:
+        return
+    item = dict(entry)
+    item["value"] = key_value
+    item["search_key"] = key
+    item["updated_at"] = now_iso()
+
+    bucket = index_data.setdefault(section, {})
+    records = bucket.setdefault(key, [])
+
+    # Avoid exact duplicate entries while allowing real duplicate BOX/LOT values across attempts.
+    sig = (
+        item.get("type"),
+        item.get("delivery_no"),
+        item.get("attempt_folder"),
+        item.get("inner_ref"),
+        item.get("toc_ref"),
+        item.get("path"),
+    )
+    for old in records:
+        old_sig = (
+            old.get("type"),
+            old.get("delivery_no"),
+            old.get("attempt_folder"),
+            old.get("inner_ref"),
+            old.get("toc_ref"),
+            old.get("path"),
+        )
+        if old_sig == sig:
+            old.update(item)
+            return
+    records.append(item)
+
+
+def derive_attempt_status_from_folder(folder_name):
+    try:
+        parts = str(folder_name or "").split("_")
+        return parts[-1].upper() if len(parts) >= 3 else "UNKNOWN"
+    except Exception:
+        return "UNKNOWN"
+
+
+def build_entry_base(job, job_json_path):
+    attempt_dir = os.path.dirname(job_json_path)
+    delivery_dir = os.path.dirname(attempt_dir)
+    attempt_folder = os.path.basename(attempt_dir)
+    return {
+        "job_id": job.get("job_id", ""),
+        "operator_en": job.get("operator_en", ""),
+        "delivery_no": job.get("picking", {}).get("picking_delivery_no", job.get("delivery_no", delivery_no)),
+        "attempt_no": job.get("attempt_no", job.get("attempt", {}).get("attempt_no", "")),
+        "attempt_folder": attempt_folder,
+        "attempt_status": job.get("status", derive_attempt_status_from_folder(attempt_folder)),
+        "attempt_start_time": job.get("start_time", job.get("job_started_at", "")),
+        "attempt_end_time": job.get("end_time", job.get("job_finished_at", "")),
+        "delivery_path": rel_storage_path(delivery_dir),
+        "attempt_path": rel_storage_path(attempt_dir),
+        "job_json": rel_storage_path(job_json_path),
+    }
+
+
+def rebuild_global_search_index():
+    """
+    Rebuild one global search index from all job.json files under storage/.
+    This is intentionally simple and reliable for the current 90-day storage size.
+    """
+    ensure_dir(STORAGE_ROOT)
+    index_data = blank_global_index()
+
+    try:
+        for root_dir, _, files in os.walk(STORAGE_ROOT):
+            if "job.json" not in files:
+                continue
+            job_json_path = os.path.join(root_dir, "job.json")
+            job = read_json_safely(job_json_path)
+            if not isinstance(job, dict):
+                continue
+
+            base = build_entry_base(job, job_json_path)
+            delivery_value = base.get("delivery_no", "")
+
+            add_index_entry(index_data, "delivery_nos", delivery_value, {
+                **base,
+                "type": "DELIVERY_NO",
+                "path": base.get("attempt_path", ""),
+                "summary_path": rel_storage_path(os.path.join(os.path.dirname(root_dir), "delivery_summary.json")),
+            })
+
+            for rec in job.get("inner_boxes", []) or []:
+                if not isinstance(rec, dict):
+                    continue
+                inner_ref = rec.get("inner_ref") or f"INNER_{int(rec.get('sequence', 0) or 0):03d}"
+                inner_path = os.path.join(root_dir, "inner_boxes", inner_ref)
+                common = {
+                    **base,
+                    "type": "INNER_BOX",
+                    "inner_ref": inner_ref,
+                    "sequence": rec.get("sequence", ""),
+                    "path": rel_storage_path(inner_path),
+                    "inner_summary": rel_storage_path(os.path.join(inner_path, "inner_summary.json")),
+                    "ocr_result": rel_storage_path(os.path.join(rec.get("process_attempt_folder", ""), "ocr_result.json")) if rec.get("process_attempt_folder") else "",
+                    "validation_result": rec.get("validation_result", ""),
+                    "fail_reason": rec.get("fail_reason", []),
+                    "record_start_time": rec.get("start_time", ""),
+                    "record_end_time": rec.get("end_time", ""),
+                }
+                add_index_entry(index_data, "box_ids", rec.get("vendor_box_id", ""), {**common, "type": "VENDOR_BOX_ID"})
+                add_index_entry(index_data, "toa_lots", rec.get("toa_lot_no", ""), {**common, "type": "TOA_LOT_NO"})
+                add_index_entry(index_data, "tob_lots", rec.get("tob_lot_no", ""), {**common, "type": "TOB_LOT_NO"})
+
+            for rec in job.get("outer_boxes", []) or []:
+                if not isinstance(rec, dict):
+                    continue
+                toc_ref = rec.get("toc_ref") or f"TOC_{int(rec.get('outer_box_no', 0) or 0):03d}"
+                toc_path = os.path.join(root_dir, "outer_toc", toc_ref)
+                common = {
+                    **base,
+                    "type": "OUTER_TOC",
+                    "toc_ref": toc_ref,
+                    "outer_box_no": rec.get("outer_box_no", ""),
+                    "path": rel_storage_path(toc_path),
+                    "toc_summary": rel_storage_path(os.path.join(toc_path, "toc_summary.json")),
+                    "ocr_result": rel_storage_path(os.path.join(rec.get("storage_folder", ""), "ocr_result.json")) if rec.get("storage_folder") else "",
+                    "validation_result": rec.get("validation_result", ""),
+                    "fail_reason": rec.get("fail_reason", []),
+                    "matched_inner_boxes": rec.get("matched_inner_boxes", []),
+                    "unmatched_lots": rec.get("unmatched_lots", []),
+                    "record_start_time": rec.get("start_time", ""),
+                    "record_end_time": rec.get("end_time", ""),
+                }
+                add_index_entry(index_data, "toc_delivery_nos", rec.get("toc_delivery_no", ""), {**common, "type": "TOC_DELIVERY_NO"})
+                for lot in rec.get("toc_lot_no_list", []) or []:
+                    add_index_entry(index_data, "toc_lots", lot, {**common, "type": "TOC_LOT_NO"})
+
+        total = 0
+        for section in ["delivery_nos", "box_ids", "toa_lots", "tob_lots", "toc_delivery_nos", "toc_lots"]:
+            total += sum(len(v) for v in index_data.get(section, {}).values())
+        index_data["record_count"] = total
+        index_data["updated_at"] = now_iso()
+        write_json_file(GLOBAL_SEARCH_INDEX_PATH, index_data)
+        print("Saved global_search_index.json:", GLOBAL_SEARCH_INDEX_PATH)
+    except Exception as e:
+        print("Rebuild global_search_index error:", e)
+
+
+def search_global_index(value):
+    """Helper for future UI/API: returns all entries that match a BOX/LOT/Delivery value."""
+    index_data = read_json_safely(GLOBAL_SEARCH_INDEX_PATH)
+    if not isinstance(index_data, dict):
+        return []
+    key = normalize_text_for_compare(value)
+    results = []
+    for section in ["delivery_nos", "box_ids", "toa_lots", "tob_lots", "toc_delivery_nos", "toc_lots"]:
+        results.extend(index_data.get(section, {}).get(key, []))
+    return results
+
+def save_delivery_summary():
+    if not delivery_storage_dir:
+        return
+    attempts = []
+    try:
+        for name in sorted(os.listdir(delivery_storage_dir)):
+            if not name.startswith("attempt_"):
+                continue
+            job_path = os.path.join(delivery_storage_dir, name, "job.json")
+            status = name.split("_")[-1].upper() if "_" in name else "UNKNOWN"
+            attempt_item = {
+                "attempt_folder": name,
+                "status": status,
+                "job_json": job_path if os.path.exists(job_path) else "",
+            }
+            if os.path.exists(job_path):
+                try:
+                    with open(job_path, "r", encoding="utf-8") as jf:
+                        jd = json.load(jf)
+                    attempt_item.update({
+                        "attempt_no": jd.get("attempt_no", ""),
+                        "operator_en": jd.get("operator_en", ""),
+                        "start_time": jd.get("start_time", jd.get("job_started_at", "")),
+                        "end_time": jd.get("end_time", jd.get("job_finished_at", "")),
+                        "duration_sec": jd.get("duration_sec", None),
+                        "overall_result": jd.get("summary", {}).get("overall_result", ""),
+                    })
+                except Exception:
+                    pass
+            attempts.append(attempt_item)
+    except Exception as e:
+        print("Delivery summary scan error:", e)
+
+    summary = {
+        "project": "AI-Based Validation System for Shipping Label Verification",
+        "delivery_no": delivery_no,
+        "operator_en": en_no,
+        "updated_at": now_iso(),
+        "attempt_count": len(attempts),
+        "attempts": attempts,
+    }
+    try:
+        write_json_file(os.path.join(delivery_storage_dir, "delivery_summary.json"), summary)
+        print("Saved delivery_summary.json")
+    except Exception as e:
+        print("Save delivery_summary error:", e)
+
+
+def finalize_attempt_status(status, reason=""):
+    """Rename attempt_XXX_running to attempt_XXX_completed/cancelled/failed without overwriting old attempts."""
+    global attempt_storage_dir, attempt_status, job_storage_dir
+    if not attempt_storage_dir:
+        return
+
+    status = str(status or "RUNNING").upper()
+    attempt_status = status
+
+    if job_data:
+        finished = now_iso() if status != "RUNNING" else ""
+        job_data["status"] = status
+        job_data["job_finished_at"] = finished
+        job_data["end_time"] = finished
+        if finished:
+            job_data["duration_sec"] = seconds_between(job_data.get("start_time") or job_data.get("job_started_at"), finished)
+        job_data.setdefault("attempt", {})["status"] = status
+        job_data["attempt"]["end_time"] = finished
+        job_data["attempt"]["duration_sec"] = seconds_between(job_data["attempt"].get("start_time"), finished) if finished else None
+        if reason:
+            if status == "CANCELLED":
+                job_data["cancel_reason"] = reason
+            elif status == "FAILED":
+                job_data["fail_reason"] = reason
+        update_job_summary()
+        save_job_json()
+
+    parent = os.path.dirname(attempt_storage_dir)
+    target = os.path.join(parent, attempt_folder_name(attempt_no, status))
+    if os.path.abspath(target) != os.path.abspath(attempt_storage_dir):
+        base_target = target
+        suffix = 1
+        while os.path.exists(target):
+            # Should almost never happen because attempt_no is unique, but never overwrite.
+            target = base_target + f"_dup{suffix}"
+            suffix += 1
+        try:
+            os.rename(attempt_storage_dir, target)
+            attempt_storage_dir = target
+            job_storage_dir = target
+        except Exception as e:
+            print("Attempt rename error:", e)
+    save_delivery_summary()
+    rebuild_global_search_index()
+
+
+def init_job_data():
+    global job_id, job_started_at, job_storage_dir, job_data
+    global delivery_storage_dir, attempt_storage_dir, attempt_no, attempt_status, process_attempt_counter
+
+    job_started_at = now_iso()
+    job_id = make_job_id(delivery_no)
+
+    delivery_storage_dir = ensure_dir(get_delivery_dir(delivery_no))
+    attempt_no = find_next_attempt_no(delivery_storage_dir)
+    attempt_status = "RUNNING"
+    attempt_storage_dir = ensure_dir(os.path.join(delivery_storage_dir, attempt_folder_name(attempt_no, attempt_status)))
+    job_storage_dir = attempt_storage_dir
+    process_attempt_counter = {}
+
+    ensure_dir(os.path.join(job_storage_dir, "inner_boxes"))
+    ensure_dir(os.path.join(job_storage_dir, "outer_toc"))
+
+    job_data = {
+        "project": "AI-Based Validation System for Shipping Label Verification",
+        "design_version": "V2.4_GLOBAL_SEARCH_INDEX",
+        "phase": "PHASE_2_DATA_MODEL_STORAGE_VALIDATION",
+        "job_id": job_id,
+        "status": "RUNNING",
+        "attempt_no": attempt_no,
+        "attempt_folder": os.path.basename(attempt_storage_dir),
+        "created_at": job_started_at,
+        "start_time": job_started_at,
+        "end_time": "",
+        "duration_sec": None,
+        "job_started_at": job_started_at,
+        "job_finished_at": "",
+        "operator_en": en_no,
+        "picking": {
+            "picking_delivery_no": delivery_no,
+            "picking_box_id": "",  # Future Phase 4: from Picking List / API
+            "picking_item_qty": quantity,
+        },
+        "summary": {
+            "inner_box_total": quantity,
+            "outer_box_total": outer_total,
+            "pass_count": 0,
+            "fail_count": 0,
+            "overall_result": "WAIT",
+        },
+        "inner_boxes": [],
+        "outer_boxes": [],
+        "attempt": {
+            "attempt_no": attempt_no,
+            "status": "RUNNING",
+            "created_at": job_started_at,
+            "start_time": job_started_at,
+            "end_time": "",
+            "duration_sec": None,
+        },
+        "events": [
+            {"time": job_started_at, "event": "JOB_STARTED", "status": "RUNNING"}
+        ],
+        "input_validation": last_input_validation,
+        "input_scan_logs": input_scan_logs[-20:],
+        "device_precheck": {
+            "usb_device_candidates": USB_DEVICE_CANDIDATES,
+            "resolved_usb_device": resolved_usb_device,
+        },
+    }
+    save_job_json()
+    save_delivery_summary()
+    rebuild_global_search_index()
+
+
+def save_job_json():
+    if not job_storage_dir or not job_data:
+        return
+    try:
+        job_data["attempt_folder"] = os.path.basename(job_storage_dir)
+        job_data["updated_at"] = now_iso()
+        path = os.path.join(job_storage_dir, "job.json")
+        write_json_file(path, job_data)
+        print("Saved job.json:", path)
+    except Exception as e:
+        print("Save job.json error:", e)
+
+
+def update_job_summary():
+    if not job_data:
+        return
+    records = job_data.get("inner_boxes", []) + job_data.get("outer_boxes", [])
+    pass_count = sum(1 for r in records if r.get("validation_result") == "PASS")
+    fail_count = sum(1 for r in records if r.get("validation_result") == "FAIL")
+    wait_count = sum(1 for r in records if r.get("validation_result") == "WAIT")
+
+    if fail_count > 0:
+        overall = "FAIL"
+    elif wait_count > 0 or len(records) == 0:
+        overall = "WAIT"
+    else:
+        overall = "PASS"
+
+    job_data["summary"].update({
+        "pass_count": pass_count,
+        "fail_count": fail_count,
+        "overall_result": overall,
+    })
+
+
+def save_record_json(record, folder, filename="ocr_result.json"):
+    ensure_dir(folder)
+    path = os.path.join(folder, filename)
+    try:
+        write_json_file(path, record)
+        print("Saved record JSON:", path)
+    except Exception as e:
+        print("Save record error:", e)
+
+
+def upsert_record(record_list, key_name, key_value, record):
+    for i, old in enumerate(record_list):
+        if old.get(key_name) == key_value:
+            record_list[i] = record
+            return
+    record_list.append(record)
+
+
+def get_clean_ocr(data):
+    return clean_value((data or {}).get("clean", ""), "")
+
+
+def collect_ocr_assets(data):
+    data = data or {}
+    return {
+        "created_at": data.get("created_at", data.get("ocr_started_at", "")),
+        "updated_at": data.get("updated_at", data.get("ocr_finished_at", "")),
+        "capture_time": data.get("capture_time", file_time_iso(data.get("image_path", ""))),
+        "ocr_started_at": data.get("ocr_started_at", ""),
+        "ocr_finished_at": data.get("ocr_finished_at", ""),
+        "ocr_duration_sec": data.get("ocr_duration_sec", None),
+        "image_path": data.get("image_path", ""),
+        "roi_path": data.get("roi_path", ""),
+        "processed_path": data.get("processed_path", ""),
+        "raw": data.get("raw", ""),
+        "clean": data.get("clean", ""),
+        "items": data.get("items", []),
+        "box": data.get("box", []),
+        "source": data.get("source", ""),
+    }
+
+
+def next_process_attempt_dir(scope, ref, final_parent=None):
+    """Create a new process_attempt_XXX_running folder. Used for Reset Process history."""
+    global current_process_attempt_dir, current_process_attempt_meta
+    scope_key = f"{scope}:{ref}"
+    process_attempt_counter[scope_key] = process_attempt_counter.get(scope_key, 0) + 1
+    no = process_attempt_counter[scope_key]
+
+    if final_parent:
+        parent = final_parent
+    elif scope == "inner":
+        parent = os.path.join(job_storage_dir, "inner_boxes", ref)
+    else:
+        parent = os.path.join(job_storage_dir, "outer_toc", ref)
+
+    folder = ensure_dir(os.path.join(parent, f"process_attempt_{no:03d}_running"))
+    current_process_attempt_dir = folder
+    started = now_iso()
+    current_process_attempt_meta = {
+        "scope": scope,
+        "ref": ref,
+        "process_attempt_no": no,
+        "status": "RUNNING",
+        "created_at": started,
+        "started_at": started,
+        "start_time": started,
+        "finished_at": "",
+        "end_time": "",
+        "duration_sec": None,
+        "folder": folder,
+        "images": [],
+        "actions": [
+            {"time": started, "action": "PROCESS_ATTEMPT_STARTED", "status": "RUNNING"}
+        ],
+    }
+    add_job_event("PROCESS_ATTEMPT_STARTED", "RUNNING", {"scope": scope, "ref": ref, "process_attempt_no": no})
+    save_record_json(current_process_attempt_meta, folder, "process_attempt.json")
+    return folder
+
+
+def add_process_image(path, label):
+    if not current_process_attempt_meta or not path:
+        return
+    current_process_attempt_meta.setdefault("images", []).append({"time": now_iso(), "label": label, "path": path, "capture_time": file_time_iso(path)})
+    try:
+        save_record_json(current_process_attempt_meta, current_process_attempt_meta["folder"], "process_attempt.json")
+    except Exception:
+        pass
+
+
+def finalize_process_attempt(status="final", extra=None):
+    """Rename process_attempt_XXX_running to process_attempt_XXX_final/reset/failed."""
+    global current_process_attempt_dir, current_process_attempt_meta
+    if not current_process_attempt_dir or not os.path.exists(current_process_attempt_dir):
+        return ""
+
+    status = str(status or "final").lower()
+    meta = dict(current_process_attempt_meta or {})
+    finished = now_iso()
+    meta["status"] = status.upper()
+    meta["finished_at"] = finished
+    meta["end_time"] = finished
+    meta["duration_sec"] = seconds_between(meta.get("start_time") or meta.get("started_at"), finished)
+    meta.setdefault("actions", []).append({"time": finished, "action": f"PROCESS_ATTEMPT_{status.upper()}", "status": status.upper()})
+    if extra:
+        meta.update(extra)
+    save_record_json(meta, current_process_attempt_dir, "process_attempt.json")
+    add_job_event(f"PROCESS_ATTEMPT_{status.upper()}", status.upper(), {"scope": meta.get("scope"), "ref": meta.get("ref"), "process_attempt_no": meta.get("process_attempt_no"), "duration_sec": meta.get("duration_sec")})
+
+    parent = os.path.dirname(current_process_attempt_dir)
+    basename = os.path.basename(current_process_attempt_dir)
+    if basename.endswith("_running"):
+        target = os.path.join(parent, basename[:-8] + f"_{status}")
+    else:
+        target = current_process_attempt_dir + f"_{status}"
+
+    if os.path.abspath(target) != os.path.abspath(current_process_attempt_dir):
+        base_target = target
+        suffix = 1
+        while os.path.exists(target):
+            target = base_target + f"_dup{suffix}"
+            suffix += 1
+        try:
+            os.rename(current_process_attempt_dir, target)
+            current_process_attempt_dir = target
+            meta["folder"] = target
+            save_record_json(meta, current_process_attempt_dir, "process_attempt.json")
+        except Exception as e:
+            print("Process attempt rename error:", e)
+    final_dir = current_process_attempt_dir
+    current_process_attempt_dir = ""
+    current_process_attempt_meta = {}
+    return final_dir
+
+
+def relocate_process_attempt_to_parent(process_dir, target_parent):
+    """Move process attempt from UNKNOWN/PENDING folder into final Vendor/TOC folder after OCR gives final key."""
+    global current_process_attempt_dir, current_process_attempt_meta
+    if not process_dir or not os.path.exists(process_dir):
+        return ""
+    ensure_dir(target_parent)
+    target = os.path.join(target_parent, os.path.basename(process_dir))
+    if os.path.abspath(process_dir) == os.path.abspath(target):
+        return process_dir
+    base_target = target
+    suffix = 1
+    while os.path.exists(target):
+        target = base_target + f"_dup{suffix}"
+        suffix += 1
+    try:
+        shutil.move(process_dir, target)
+        if os.path.abspath(current_process_attempt_dir or "") == os.path.abspath(process_dir):
+            current_process_attempt_dir = target
+            if current_process_attempt_meta:
+                current_process_attempt_meta["folder"] = target
+                save_record_json(current_process_attempt_meta, target, "process_attempt.json")
+        return target
+    except Exception as e:
+        print("Move process attempt error:", e)
+        return process_dir
+
+
+def build_inner_box_record(inner_no, cam1_data, cam2_data, process_dir=""):
+    # Current test OCR has only one center ROI per camera.
+    # Mapping below keeps the existing UI behavior while storing variables using the final Data Dictionary names.
+    # V2.2 change:
+    # - Inner folder is stable: INNER_001, INNER_002, ...
+    # - Vendor/TOA/TOB evidence belongs inside each process_attempt folder.
+    # - Do NOT create INNER_001_VENDOR_PENDING / UNKNOWN / VALUE anymore.
+    cam1_text = get_clean_ocr(cam1_data)
+    cam2_text = get_clean_ocr(cam2_data)
+
+    vendor_box_id = cam1_text
+    vendor_date_code = cam1_text
+    toa_lot_no = cam1_text
+    toa_date_code = cam1_text
+    tob_lot_no = cam2_text
+    tob_date_code = cam2_text
+
+    fail_reason = []
+
+    picking_box_id = job_data.get("picking", {}).get("picking_box_id", "") if job_data else ""
+    if picking_box_id:
+        if normalize_text_for_compare(picking_box_id) != normalize_text_for_compare(vendor_box_id):
+            fail_reason.append("RULE_1_PICKING_BOX_ID_NOT_MATCH_VENDOR_BOX_ID")
+
+    date_values = [vendor_date_code, toa_date_code, tob_date_code]
+    if all(date_values) and len(set(normalize_text_for_compare(v) for v in date_values)) != 1:
+        fail_reason.append("RULE_3_DATE_CODE_NOT_MATCH")
+
+    previous_toa = [x.get("toa_lot_no", "") for x in job_data.get("inner_boxes", []) if x.get("sequence") != inner_no] if job_data else []
+    previous_tob = [x.get("tob_lot_no", "") for x in job_data.get("inner_boxes", []) if x.get("sequence") != inner_no] if job_data else []
+
+    if toa_lot_no and normalize_text_for_compare(toa_lot_no) in [normalize_text_for_compare(x) for x in previous_toa]:
+        fail_reason.append("RULE_5_TOA_LOT_DUPLICATE_IN_JOB")
+    if tob_lot_no and normalize_text_for_compare(tob_lot_no) in [normalize_text_for_compare(x) for x in previous_tob]:
+        fail_reason.append("RULE_6_TOB_LOT_DUPLICATE_IN_JOB")
+
+    validation_result = "FAIL" if fail_reason else "PASS"
+
+    inner_ref = f"INNER_{inner_no:03d}"
+    inner_folder = ensure_dir(os.path.join(job_storage_dir, "inner_boxes", inner_ref)) if job_storage_dir else ""
+
+    # process_attempt is the owner of the OCR/evidence result for this round.
+    # If process_dir is missing for any reason, fall back to inner_folder to avoid crashing.
+    process_storage_folder = process_dir or inner_folder
+
+    vendor_folder_name = f"Vendor_{safe_folder_name(vendor_box_id)}"
+    toa_folder_name = f"TOA_{safe_folder_name(toa_lot_no)}"
+    tob_folder_name = f"TOB_{safe_folder_name(tob_lot_no)}"
+
+    vendor_folder = ensure_dir(os.path.join(process_storage_folder, vendor_folder_name)) if process_storage_folder else ""
+    toa_folder = ensure_dir(os.path.join(process_storage_folder, toa_folder_name)) if process_storage_folder else ""
+    tob_folder = ensure_dir(os.path.join(process_storage_folder, tob_folder_name)) if process_storage_folder else ""
+
+    evidence = {
+        "vendor": {
+            "full_image": copy_if_exists(cam1_data.get("image_path", ""), vendor_folder, "full_vendor_toa.jpg"),
+            "roi_image": copy_if_exists(cam1_data.get("roi_path", ""), vendor_folder, f"vendor_boxid_{safe_folder_name(vendor_box_id)}.jpg"),
+            "processed_image": copy_if_exists(cam1_data.get("processed_path", ""), vendor_folder, "processed_vendor.jpg"),
+        },
+        "toa": {
+            "full_image": copy_if_exists(cam1_data.get("image_path", ""), toa_folder, "full_vendor_toa.jpg"),
+            "roi_image": copy_if_exists(cam1_data.get("roi_path", ""), toa_folder, f"toa_lot_{safe_folder_name(toa_lot_no)}.jpg"),
+            "processed_image": copy_if_exists(cam1_data.get("processed_path", ""), toa_folder, "processed_toa.jpg"),
+        },
+        "tob": {
+            "full_image": copy_if_exists(cam2_data.get("image_path", ""), tob_folder, "full_tob.jpg"),
+            "roi_image": copy_if_exists(cam2_data.get("roi_path", ""), tob_folder, f"tob_lot_{safe_folder_name(tob_lot_no)}.jpg"),
+            "processed_image": copy_if_exists(cam2_data.get("processed_path", ""), tob_folder, "processed_tob.jpg"),
+        },
+    }
+
+    record = {
+        "type": "inner_box",
+        "inner_ref": inner_ref,
+        "sequence": inner_no,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "start_time": (current_process_attempt_meta or {}).get("start_time", ""),
+        "end_time": now_iso(),
+        "duration_sec": seconds_between((current_process_attempt_meta or {}).get("start_time", ""), now_iso()),
+        "process_attempt_no": (current_process_attempt_meta or {}).get("process_attempt_no", None),
+        "operator_en": en_no,
+        "delivery_no": delivery_no,
+        "vendor_box_id": vendor_box_id,
+        "vendor_date_code": vendor_date_code,
+        "toa_lot_no": toa_lot_no,
+        "toa_date_code": toa_date_code,
+        "tob_lot_no": tob_lot_no,
+        "tob_date_code": tob_date_code,
+        "validation_result": validation_result,
+        "fail_reason": fail_reason,
+        "validation": {
+            "rule_1_picking_box_id_eq_vendor_box_id": "WAIT_PICKING_BOX_ID" if not picking_box_id else ("PASS" if "RULE_1_PICKING_BOX_ID_NOT_MATCH_VENDOR_BOX_ID" not in fail_reason else "FAIL"),
+            "rule_3_date_code_match_all": "PASS" if "RULE_3_DATE_CODE_NOT_MATCH" not in fail_reason else "FAIL",
+            "rule_5_toa_lot_not_duplicate": "PASS" if "RULE_5_TOA_LOT_DUPLICATE_IN_JOB" not in fail_reason else "FAIL",
+            "rule_6_tob_lot_not_duplicate": "PASS" if "RULE_6_TOB_LOT_DUPLICATE_IN_JOB" not in fail_reason else "FAIL",
+        },
+        "ocr": {
+            "cam1_vendor_toa": collect_ocr_assets(cam1_data),
+            "cam2_tob": collect_ocr_assets(cam2_data),
+        },
+        "evidence": evidence,
+        "process_attempt_folder": process_storage_folder,
+        "storage_folder": inner_folder,
+    }
+
+    # Summary file at INNER_001 level tells which OCR values are currently the latest/final view.
+    inner_summary = {
+        "inner_ref": inner_ref,
+        "sequence": inner_no,
+        "created_at": file_time_iso(os.path.join(inner_folder, "inner_summary.json")) or record["created_at"],
+        "updated_at": now_iso(),
+        "latest_start_time": record.get("start_time", ""),
+        "latest_end_time": record.get("end_time", ""),
+        "latest_duration_sec": record.get("duration_sec", None),
+        "latest_vendor_box_id": vendor_box_id or "UNKNOWN",
+        "latest_toa_lot_no": toa_lot_no or "UNKNOWN",
+        "latest_tob_lot_no": tob_lot_no or "UNKNOWN",
+        "latest_validation_result": validation_result,
+        "latest_process_attempt_folder": process_storage_folder,
+    }
+    if inner_folder:
+        save_record_json(inner_summary, inner_folder, "inner_summary.json")
+
+    return record
+
+def save_inner_record(record):
+    if not job_data:
+        return
+    upsert_record(job_data["inner_boxes"], "sequence", record["sequence"], record)
+    update_job_summary()
+    save_record_json(record, record.get("process_attempt_folder") or record.get("storage_folder", job_storage_dir))
+    save_job_json()
+    save_delivery_summary()
+    rebuild_global_search_index()
+
+
+def get_inner_lot_map():
+    lot_map = {}
+    if not job_data:
+        return lot_map
+    for rec in job_data.get("inner_boxes", []):
+        lot = rec.get("toa_lot_no", "")
+        if lot:
+            lot_map[normalize_text_for_compare(lot)] = {
+                "inner_ref": rec.get("inner_ref", ""),
+                "toa_lot_no": lot,
+                "vendor_box_id": rec.get("vendor_box_id", ""),
+            }
+    return lot_map
+
+
+def build_outer_box_record(toc_no, toc_total, item_map, fallback_data=None, process_dir=""):
+    item_map = item_map or {}
+    toc_delivery_no = get_clean_ocr(item_map.get("toc") or fallback_data or {})
+
+    lot_list = []
+    for name in ["toc1", "toc2", "toc3", "toc4", "toc5", "toc6"]:
+        lot = get_clean_ocr(item_map.get(name, {}))
+        if lot:
+            lot_list.append(lot)
+
+    lot_map = get_inner_lot_map()
+    matched_inner_boxes = []
+    unmatched_lots = []
+    for lot in lot_list:
+        matched = lot_map.get(normalize_text_for_compare(lot))
+        if matched:
+            matched_inner_boxes.append(matched["inner_ref"])
+        else:
+            unmatched_lots.append(lot)
+
+    fail_reason = []
+    if toc_delivery_no and delivery_no and normalize_text_for_compare(toc_delivery_no) != normalize_text_for_compare(delivery_no):
+        fail_reason.append("RULE_2_PICKING_DELIVERY_NO_NOT_MATCH_TOC_DELIVERY_NO")
+    if unmatched_lots:
+        fail_reason.append("RULE_4_TOA_LOT_NOT_FOUND_IN_TOC_LOT_LIST")
+
+    validation_result = "FAIL" if fail_reason else "PASS"
+    toc_ref = f"TOC_{toc_no:03d}"
+    toc_folder = ensure_dir(os.path.join(job_storage_dir, "outer_toc", toc_ref)) if job_storage_dir else ""
+    if process_dir:
+        # Keep all TOC / TOC1-TOC6 evidence inside the current process attempt.
+        # Correct V2 storage:
+        # outer_toc/TOC_001/process_attempt_XXX_running|reset|final/TOC, TOC1, ... TOC6
+        process_dir = relocate_process_attempt_to_parent(process_dir, toc_folder)
+    process_storage_folder = process_dir or toc_folder
+
+    evidence = {}
+    for name, data in item_map.items():
+        # IMPORTANT: row folders must live inside process_attempt, not directly under TOC_001.
+        row_folder = ensure_dir(os.path.join(process_storage_folder, name.upper())) if process_storage_folder else ""
+        evidence[name] = {
+            "full_image": copy_if_exists(data.get("image_path", ""), row_folder, f"full_{name}.jpg"),
+            "roi_image": copy_if_exists(data.get("roi_path", ""), row_folder, f"roi_{name}_{safe_folder_name(data.get('clean', ''))}.jpg"),
+            "processed_image": copy_if_exists(data.get("processed_path", ""), row_folder, f"processed_{name}.jpg"),
+        }
+
+    if fallback_data is not None and "toc" not in evidence:
+        # Fallback is also evidence from this process attempt, so keep it inside process_attempt too.
+        row_folder = ensure_dir(os.path.join(process_storage_folder, "TOC_FALLBACK")) if process_storage_folder else ""
+        evidence["toc_fallback"] = {
+            "full_image": copy_if_exists(fallback_data.get("image_path", ""), row_folder, "full_toc_fallback.jpg"),
+            "roi_image": copy_if_exists(fallback_data.get("roi_path", ""), row_folder, "roi_toc_fallback.jpg"),
+            "processed_image": copy_if_exists(fallback_data.get("processed_path", ""), row_folder, "processed_toc_fallback.jpg"),
+        }
+
+    process_final_dir = process_dir or ""
+
+    return {
+        "type": "outer_box",
+        "toc_ref": toc_ref,
+        "outer_box_no": toc_no,
+        "outer_box_total": toc_total,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "start_time": (current_process_attempt_meta or {}).get("start_time", ""),
+        "end_time": now_iso(),
+        "duration_sec": seconds_between((current_process_attempt_meta or {}).get("start_time", ""), now_iso()),
+        "process_attempt_no": (current_process_attempt_meta or {}).get("process_attempt_no", None),
+        "operator_en": en_no,
+        "delivery_no": delivery_no,
+        "toc_delivery_no": toc_delivery_no,
+        "toc_lot_no_list": lot_list,
+        "matched_inner_boxes": matched_inner_boxes,
+        "unmatched_lots": unmatched_lots,
+        "validation_result": validation_result,
+        "fail_reason": fail_reason,
+        "validation": {
+            "rule_2_picking_delivery_no_eq_toc_delivery_no": "PASS" if "RULE_2_PICKING_DELIVERY_NO_NOT_MATCH_TOC_DELIVERY_NO" not in fail_reason else "FAIL",
+            "rule_4_toa_lot_exists_in_toc_lot_list": "PASS" if "RULE_4_TOA_LOT_NOT_FOUND_IN_TOC_LOT_LIST" not in fail_reason else "FAIL",
+        },
+        "ocr": {name: collect_ocr_assets(data) for name, data in item_map.items()},
+        "fallback": collect_ocr_assets(fallback_data) if fallback_data else None,
+        "evidence": evidence,
+        "process_attempt_final": process_final_dir,
+        "toc_folder": toc_folder,
+        # Save ocr_result.json inside process_attempt so reset/final history is complete.
+        "storage_folder": process_storage_folder,
+    }
+
+
+def save_outer_record(record):
+    if not job_data:
+        return
+    upsert_record(job_data["outer_boxes"], "outer_box_no", record["outer_box_no"], record)
+    update_job_summary()
+    save_record_json(record, record.get("storage_folder", job_storage_dir))
+    save_job_json()
+    save_delivery_summary()
+    rebuild_global_search_index()
+
+
+def finish_job_data():
+    if not job_data:
+        return
+    job_data.setdefault("events", []).append({
+        "time": now_iso(),
+        "event": "JOB_COMPLETED",
+        "status": "COMPLETED",
+    })
+    finalize_attempt_status("COMPLETED")
+
+
+def fail_job_data(reason="process_failed"):
+    if not job_data:
+        return
+    if current_process_attempt_dir:
+        finalize_process_attempt("failed", {"reason": reason})
+    job_data.setdefault("events", []).append({
+        "time": now_iso(),
+        "event": "JOB_FAILED",
+        "status": "FAILED",
+        "fail_reason": reason,
+    })
+    finalize_attempt_status("FAILED", reason)
+
+def dbg(msg):
+    try:
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        th = threading.current_thread().name
+        ev = action_event.is_set()
+        print(f"[DBG {ts} {th} action={action_value} event={ev} running={running}] {msg}", flush=True)
+    except Exception as e:
+        print("[DBG ERROR]", e, msg, flush=True)
+
+
+def ui_call(name, func):
+    try:
+        dbg(f"UI_CALL START: {name}")
+        func()
+        dbg(f"UI_CALL END: {name}")
+    except Exception:
+        print(f"[UI ERROR] {name}", flush=True)
+        traceback.print_exc()
+
+
+def now_name(prefix):
+    return datetime.now().strftime(f"{prefix}_%Y%m%d_%H%M%S_%f.jpg")
+
+
+def capture_path(prefix):
+    return os.path.join(CAPTURE_DIR, now_name(prefix))
+
+
+def current_process_alive():
+    """Used by camera loops. False means current capture should stop/restart/cancel."""
+    return running and action_value is None
+
+
+def set_action(action):
+    """Set user action: next, restart, or cancel."""
+    global action_value, running, current_camera
+
+    dbg(f"ACTION requested: {action}")
+    action_value = action
+    action_event.set()
+
+    if action == "cancel":
+        running = False
+
+    # Force camera loops to unblock quickly.
+    try:
+        if current_camera is not None:
+            current_camera.close()
+    except Exception:
+        pass
+
+
+def clear_action():
+    global action_value
+    action_value = None
+    action_event.clear()
+
+
+def set_status(text):
+    try:
+        status_label.config(text=text)
+
+        color = "#f1c40f"
+        lower = text.lower()
+        if "capture" in lower or "capturing" in lower or "opening" in lower:
+            color = "#3498db"
+        elif "ocr" in lower or "reading" in lower:
+            color = "#e67e22"
+        elif "ready" in lower:
+            color = "#27ae60"
+        elif "stop" in lower or "error" in lower or "cancel" in lower:
+            color = "#c0392b"
+
+        if capture_state_label is not None:
+            capture_state_label.config(text=text)
+
+        if capture_state_dot is not None:
+            capture_state_dot.delete("all")
+            capture_state_dot.create_oval(2, 2, 12, 12, fill=color, outline=color)
+
+        root.update_idletasks()
+    except Exception:
+        pass
+
+    print(text)
+
+
+def set_step(text):
+    try:
+        step_label.config(text=text)
+        root.update_idletasks()
+    except Exception:
+        pass
+    print("STEP:", text)
+
+
+def update_preview(frame, is_bgr=False):
+    global last_preview_time
+
+    now = time.time()
+    if now - last_preview_time < PREVIEW_INTERVAL:
+        return
+    last_preview_time = now
+
+    try:
+        display = cv2.resize(frame, PREVIEW_SIZE)
+        if is_bgr:
+            display = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(display)
+        imgtk = ImageTk.PhotoImage(image=img)
+        preview_label.imgtk = imgtk
+        preview_label.config(image=imgtk, text="")
+    except Exception as e:
+        print("Preview error:", e)
+
+
+def make_thumbnail_image(image_path, size=(120, 60)):
+    try:
+        if not image_path or not os.path.exists(image_path):
+            return None
+        img = cv2.imread(image_path)
+        if img is None:
+            return None
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, size)
+        return ImageTk.PhotoImage(image=Image.fromarray(img))
+    except Exception as e:
+        print("Thumbnail error:", e)
+        return None
+
+
+def show_page(page):
+    page_name = getattr(page, "_debug_name", str(page))
+    dbg(f"show_page -> {page_name}")
+    for p in [page_input, page_capture, page_result, page_ready_toc, page_complete]:
+        p.pack_forget()
+    page.pack(fill="both", expand=True)
+    try:
+        root.update_idletasks()
+    except Exception:
+        pass
+
+
+def get_current_count(mode):
+    if mode == "outer":
+        return current_outer_index, outer_total
+    return current_index, quantity
+
+
+def update_info(mode="inner"):
+    idx, total = get_current_count(mode)
+    box_title = "Outer Box" if mode == "outer" else "Inner Box"
+
+    info_delivery.config(text=delivery_no or "-")
+    info_item.config(text=item_no or "-")
+    info_en.config(text=en_no or "-")
+    info_box_title.config(text=box_title)
+    info_box.config(text=f"{idx} / {total}" if total else "-")
+    info_pack.config(text=pack_type)
+
+
+def set_progress(mode="inner"):
+    idx, total = get_current_count(mode)
+    label = "Outer Box" if mode == "outer" else "Inner Box"
+    progress_title_label.config(text=label)
+    progress_label.config(text=f"{idx} / {total}" if total else "0 / 0")
+
+    try:
+        percent = int((idx / total) * 100) if total > 0 else 0
+        progress_percent_label.config(text=f"{percent}%")
+        progress_bar_fill.place(relx=0, rely=0, relwidth=percent / 100, relheight=1)
+    except Exception:
+        pass
+
+    root.update_idletasks()
+
+
+def set_checklist(active=None, done=None, mode="inner"):
+    """
+    Checklist count rule:
+    - TOA / TOB are Inner Box processes, so their count follows Inner Box.
+      During Outer Box capture, TOA / TOB are already finished, so show quantity/quantity.
+    - TOC is Outer Box process, so its count follows Outer Box.
+      During Inner Box capture, show the first planned Outer Box count, e.g. 1/1 or 1/6.
+    """
+    done = done or []
+
+    if mode == "outer":
+        inner_count = f"{quantity}/{quantity}" if quantity else "-/-"
+        toc_idx = current_outer_index if current_outer_index > 0 else 1
+        toc_count = f"{toc_idx}/{outer_total}" if outer_total else "-/-"
+    else:
+        inner_count = f"{current_index}/{quantity}" if quantity else "-/-"
+        toc_idx = 1 if outer_total > 0 else 0
+        toc_count = f"{toc_idx}/{outer_total}" if outer_total else "-/-"
+
+    for name, label in check_labels.items():
+        count_text = toc_count if name == "TOC" else inner_count
+
+        if name in done:
+            label.config(text=f"[OK]  {name:<4} {count_text}", fg=GREEN, bg=GREEN_BG)
+        elif active == name:
+            label.config(text=f"[RUN] {name:<4} {count_text}", fg=YELLOW_TEXT, bg=YELLOW_BG)
+        else:
+            label.config(text=f"[ ]   {name:<4} {count_text}", fg=TEXT, bg=SOFT)
+
+
+def setup_capture_page(mode="inner", active="TOA", done=None):
+    global current_screen_mode
+    current_screen_mode = "capture_outer" if mode == "outer" else "capture_inner"
+    update_info(mode)
+    set_progress(mode)
+    set_checklist(active=active, done=done or [], mode=mode)
+    show_page(page_capture)
+
+
+# =========================================================
+# OCR PROCESS HELPERS
+# =========================================================
+def process_center_roi_ocr(image_path, prefix):
+    ocr_started = now_iso()
+    img = cv2.imread(image_path)
+    if img is None:
+        ocr_finished = now_iso()
+        return {
+            "name": prefix,
+            "created_at": ocr_started,
+            "updated_at": ocr_finished,
+            "capture_time": file_time_iso(image_path),
+            "ocr_started_at": ocr_started,
+            "ocr_finished_at": ocr_finished,
+            "ocr_duration_sec": seconds_between(ocr_started, ocr_finished),
+            "image_path": image_path,
+            "error": "cannot_read_image",
+            "raw": "",
+            "clean": "",
+        }
+
+    crop, box = crop_center(img)
+    processed = preprocess_ocr(crop)
+    roi_path, processed_path = save_roi_files(image_path, crop, processed, prefix)
+    ocr = run_easyocr(processed)
+    ocr_finished = now_iso()
+
+    return {
+        "name": prefix,
+        "created_at": ocr_started,
+        "updated_at": ocr_finished,
+        "capture_time": file_time_iso(image_path),
+        "ocr_started_at": ocr_started,
+        "ocr_finished_at": ocr_finished,
+        "ocr_duration_sec": seconds_between(ocr_started, ocr_finished),
+        "source": "center_roi",
+        "image_path": image_path,
+        "roi_path": roi_path,
+        "processed_path": processed_path,
+        "box": box,
+        "raw": ocr["raw"],
+        "clean": ocr["clean"],
+        "items": ocr["items"],
+    }
+
+
+def process_yolo_roi_ocr(image_path, detections):
+    img = cv2.imread(image_path)
+    if img is None:
+        return []
+
+    results = []
+    for det in detections:
+        row_started = now_iso()
+        name = det["name"]
+        box = det["box"]
+        crop, fixed_box = crop_by_box(img, box, pad=0)
+        if crop is None or crop.size == 0:
+            continue
+
+        processed = preprocess_ocr(crop)
+        prefix = f"toc_{name}"
+        roi_path, processed_path = save_roi_files(image_path, crop, processed, prefix)
+        ocr = run_easyocr(processed)
+        row_finished = now_iso()
+
+        results.append({
+            "name": name,
+            "created_at": row_started,
+            "updated_at": row_finished,
+            "capture_time": file_time_iso(image_path),
+            "ocr_started_at": row_started,
+            "ocr_finished_at": row_finished,
+            "ocr_duration_sec": seconds_between(row_started, row_finished),
+            "source": "yolo_roi",
+            "detect_conf": det["conf"],
+            "image_path": image_path,
+            "roi_path": roi_path,
+            "processed_path": processed_path,
+            "box": fixed_box,
+            "raw": ocr["raw"],
+            "clean": ocr["clean"],
+            "items": ocr["items"],
+        })
+
+    return results
+
+
+def save_json(data, filename):
+    path = os.path.join(OCR_DIR, filename)
+    if isinstance(data, dict):
+        data.setdefault("created_at", now_iso())
+        data["updated_at"] = now_iso()
+        data["saved_at"] = now_iso()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print("Saved JSON:", path)
+
+
+# =========================================================
+# RESULT UI HELPERS
+# =========================================================
+def load_result_photo(image_path, size=(300, 86)):
+    try:
+        if not image_path or not os.path.exists(image_path):
+            return None
+        img = cv2.imread(image_path)
+        if img is None:
+            return None
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, size)
+        return ImageTk.PhotoImage(image=Image.fromarray(img))
+    except Exception as e:
+        print("Result image load error:", e)
+        return None
+
+
+def update_result_image(label, image_path, size=(340, 70)):
+    photo = load_result_photo(image_path, size=size)
+    if photo is not None:
+        label.imgtk = photo
+        label.config(image=photo, text="")
+    else:
+        label.imgtk = None
+        label.config(image="", text="NO IMAGE", fg="white", font=("Arial", 10, "bold"))
+
+
+def update_value_box(label, value):
+    text = value or "(empty)"
+    is_ok = text != "(empty)"
+    label.config(text=text, bg=GREEN_BG if is_ok else "#f8f9fa", fg=GREEN if is_ok else "#7f8c8d")
+
+
+def update_validation_box(label, value, status="WAIT"):
+    text = value or "-"
+    status = (status or "WAIT").upper()
+
+    if status == "PASS":
+        bg = GREEN_BG
+        fg = GREEN
+    elif status in ("NG", "FAIL"):
+        bg = "#fdecea"
+        fg = RED
+    else:
+        bg = "#f8f9fa"
+        fg = "#7f8c8d"
+
+    label.config(text=text, bg=bg, fg=fg)
+
+
+def update_status_badge(label, status="WAIT"):
+    status = (status or "WAIT").upper()
+
+    if status == "PASS":
+        text = "✓ PASS"
+        bg = GREEN
+        fg = "white"
+    elif status in ("NG", "FAIL"):
+        text = "✗ NG"
+        bg = RED
+        fg = "white"
+    else:
+        text = "WAIT"
+        bg = "#f1c40f"
+        fg = TEXT
+
+    label.config(text=text, bg=bg, fg=fg)
+
+
+def make_result_field(parent, field_title, value_title):
+    """
+    Result field for Inner Box validation.
+    Layout:
+    - ROI Image
+    - OCR Result
+    - Validation / DB Result
+    - Status Badge
+    """
+    block = tk.Frame(parent, bg=CARD)
+    block.pack(fill="x", pady=(0, 14))
+
+    tk.Label(
+        block,
+        text=field_title,
+        bg=CARD,
+        fg=MUTED,
+        font=("Arial", 12, "bold")
+    ).pack(anchor="w", pady=(0, 5))
+
+    img_box = tk.Label(block, bg=DARK, width=340, height=62)
+    img_box.pack(fill="x", pady=(0, 7))
+
+    # OCR Result row
+    ocr_row = tk.Frame(block, bg=CARD)
+    ocr_row.pack(fill="x", pady=(0, 4))
+
+    tk.Label(
+        ocr_row,
+        text=value_title,
+        bg=CARD,
+        fg=TEXT,
+        font=("Arial", 12, "bold"),
+        width=12,
+        anchor="w"
+    ).pack(side="left")
+
+    value_box = tk.Label(
+        ocr_row,
+        text="-",
+        bg="#f8f9fa",
+        fg="#7f8c8d",
+        font=("Arial", 17, "bold"),
+        anchor="w",
+        padx=10,
+        pady=6
+    )
+    value_box.pack(side="left", fill="x", expand=True)
+
+    # Validation / DB Result row
+    validation_row = tk.Frame(block, bg=CARD)
+    validation_row.pack(fill="x", pady=(0, 5))
+
+    tk.Label(
+        validation_row,
+        text="Validate :",
+        bg=CARD,
+        fg=TEXT,
+        font=("Arial", 12, "bold"),
+        width=12,
+        anchor="w"
+    ).pack(side="left")
+
+    validation_box = tk.Label(
+        validation_row,
+        text="WAIT",
+        bg="#f8f9fa",
+        fg="#7f8c8d",
+        font=("Arial", 14, "bold"),
+        anchor="w",
+        padx=10,
+        pady=6
+    )
+    validation_box.pack(side="left", fill="x", expand=True)
+
+    status_badge = tk.Label(
+        block,
+        text="WAIT",
+        bg="#f1c40f",
+        fg=TEXT,
+        font=("Arial", 13, "bold"),
+        padx=14,
+        pady=6
+    )
+    status_badge.pack(anchor="w")
+
+    return {
+        "image": img_box,
+        "value": value_box,
+        "validation": validation_box,
+        "status": status_badge,
+    }
+
+
+def make_product_result_section(parent, key, title, icon_key, field1, value1, field2, value2):
+    card = tk.Frame(parent, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=14, pady=12)
+    card.pack(side="left", fill="both", expand=True, padx=6)
+
+    title_row = tk.Frame(card, bg=CARD)
+    title_row.pack(fill="x", pady=(0, 12))
+    icon_label(title_row, icon_key, bg=CARD).pack(side="left", padx=(0, 8))
+    tk.Label(title_row, text=title, bg=CARD, fg=TEXT, font=("Arial", 21, "bold")).pack(side="left")
+
+    first = make_result_field(card, field1, value1)
+
+    # Reserved area for future DB / validation detail fields.
+    # Kept large because the operator page will later show extra validation data here.
+    tk.Frame(card, bg=CARD, height=180).pack(fill="x")
+
+    second = make_result_field(card, field2, value2)
+
+    result_product_slots[key] = {"first": first, "second": second}
+
+
+def update_result_field(field, image_path, ocr_value, validation_text="WAIT", status="WAIT"):
+    update_result_image(field["image"], image_path, size=(340, 62))
+    update_value_box(field["value"], ocr_value)
+    update_validation_box(field["validation"], validation_text, status)
+    update_status_badge(field["status"], status)
+
+
+def update_product_result_section(
+    key,
+    first_image_path,
+    first_value,
+    first_validation="WAIT",
+    first_status="WAIT",
+    second_image_path=None,
+    second_value=None,
+    second_validation="WAIT",
+    second_status="WAIT",
+):
+    section = result_product_slots.get(key)
+    if not section:
+        return
+
+    if second_image_path is None:
+        second_image_path = first_image_path
+    if second_value is None:
+        second_value = first_value
+
+    update_result_field(section["first"], first_image_path, first_value, first_validation, first_status)
+    update_result_field(section["second"], second_image_path, second_value, second_validation, second_status)
+
+
+def mock_read_status(value):
+    """Temporary test status until real DB / duplicate validation is connected."""
+    return "PASS" if value and value != "(empty)" else "WAIT"
+
+
+def mock_vendor_db_validation(value):
+    if value and value != "(empty)":
+        return f"DB Result : {value}"
+    return "DB Result : WAIT DB"
+
+
+def mock_duplicate_validation(value):
+    if value and value != "(empty)":
+        return "Duplicate : NOT FOUND"
+    return "Duplicate : WAIT"
+
+
+def mock_date_compare_validation(value, all_values):
+    valid_values = [v for v in all_values if v and v != "(empty)"]
+    if len(valid_values) < 3:
+        return "Compare : WAIT", "WAIT"
+    if len(set(valid_values)) == 1:
+        return "Compare : MATCH ALL", "PASS"
+    return "Compare : NOT MATCH", "NG"
+
+
+
+def normalize_text_for_compare(value):
+    return str(value or "").strip().replace(" ", "").upper()
+
+
+def get_toc_row_validation(name, clean_text):
+    """
+    Temporary TOC validation UI for testing.
+    - TOC row compares OCR value with Delivary No.
+    - TOC1-TOC6 rows compare OCR value with stored TOA Lot No values from Inner Box results.
+    """
+    read_value = clean_text if clean_text and clean_text != "(empty)" else "-"
+    name = str(name or "").lower()
+
+    if read_value == "-":
+        if name == "toc":
+            return {
+                "read": read_value,
+                "label": "Delivary No",
+                "match": delivery_no or "-",
+                "status": "WAIT",
+            }
+        return {
+            "read": read_value,
+            "label": "Matched TOA",
+            "match": "-",
+            "status": "WAIT",
+        }
+
+    if name == "toc":
+        target = delivery_no or "-"
+        status = "PASS" if normalize_text_for_compare(read_value) == normalize_text_for_compare(target) else "NG"
+        return {
+            "read": read_value,
+            "label": "Delivary No",
+            "match": target,
+            "status": status,
+        }
+
+    # TOC1-TOC6: compare with all TOA Lot No values collected during Inner Box review.
+    read_norm = normalize_text_for_compare(read_value)
+    matched = "-"
+    for _, lot_value in sorted(inner_toa_lot_by_index.items()):
+        if normalize_text_for_compare(lot_value) == read_norm:
+            matched = lot_value
+            break
+
+    status = "PASS" if matched != "-" else "NG"
+    return {
+        "read": read_value,
+        "label": "Matched TOA",
+        "match": matched,
+        "status": status,
+    }
+
+
+def make_validation_status_badge(parent, status):
+    status = (status or "WAIT").upper()
+    if status == "PASS":
+        text, bg, fg = "✓ PASS", GREEN, "white"
+    elif status == "NG":
+        text, bg, fg = "✗ NG", RED, "white"
+    else:
+        text, bg, fg = "WAIT", "#f1c40f", TEXT
+
+    return tk.Label(
+        parent,
+        text=text,
+        bg=bg,
+        fg=fg,
+        font=("Arial", 10, "bold"),
+        padx=10,
+        pady=3,
+        width=8,
+    )
+
+
+def clear_toc_cards():
+    try:
+        for w in toc_result_area.winfo_children():
+            w.destroy()
+    except Exception:
+        pass
+
+
+def add_toc_result_row(parent, row_no, title, image_data=None):
+    data = image_data or {}
+    clean_text = data.get("clean", "") or "(empty)"
+    raw_text = data.get("raw", "") or ""
+    source_text = data.get("source", "-")
+    detect_conf = data.get("detect_conf", None)
+    if detect_conf is not None:
+        source_text = f"{source_text} / DET {detect_conf:.2f}"
+
+    validation = get_toc_row_validation(title, clean_text)
+
+    row = tk.Frame(parent, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=10, pady=6)
+    row.pack(fill="x", padx=12, pady=3)
+
+    name_box = tk.Frame(row, bg=CARD, width=88)
+    name_box.pack(side="left", fill="y", padx=(0, 10))
+    name_box.pack_propagate(False)
+
+    tk.Label(name_box, text=str(row_no), bg=BLUE, fg="white", font=("Arial", 10, "bold"), width=3, pady=2).pack(anchor="w")
+    tk.Label(name_box, text=title.upper(), bg=CARD, fg=TEXT, font=("Arial", 12, "bold"), anchor="w").pack(anchor="w", pady=(4, 0))
+
+    roi_path = data.get("roi_path", "")
+    photo = load_result_photo(roi_path, size=(260, 56))
+
+    image_wrap = tk.Frame(row, bg=DARK, width=260, height=56)
+    image_wrap.pack(side="left", padx=(0, 14))
+    image_wrap.pack_propagate(False)
+
+    img_box = tk.Label(image_wrap, bg=DARK, fg="white", text="NO ROI", font=("Arial", 9, "bold"))
+    img_box.pack(fill="both", expand=True)
+    if photo is not None:
+        img_box.imgtk = photo
+        img_box.config(image=photo, text="")
+
+    info_box = tk.Frame(row, bg=CARD)
+    info_box.pack(side="left", fill="both", expand=True)
+
+    top_line = tk.Frame(info_box, bg=CARD)
+    top_line.pack(fill="x")
+    tk.Label(top_line, text="OCR Result", bg=CARD, fg=MUTED, font=("Arial", 11, "bold")).pack(side="left")
+    tk.Label(top_line, text=source_text, bg=CARD, fg=MUTED, font=("Arial", 8), anchor="e").pack(side="right")
+
+    value_box = tk.Label(
+        info_box,
+        text=clean_text,
+        bg=GREEN_BG if clean_text != "(empty)" else "#f8f9fa",
+        fg=GREEN if clean_text != "(empty)" else "#7f8c8d",
+        font=("Arial", 14, "bold"),
+        anchor="w",
+        padx=10,
+        pady=4,
+    )
+    value_box.pack(fill="x", pady=(3, 2))
+
+    tk.Label(info_box, text=f"RAW : {raw_text or '-'}", bg=CARD, fg=MUTED, font=("Arial", 9), anchor="w").pack(anchor="w")
+
+    validation_row = tk.Frame(info_box, bg=CARD)
+    validation_row.pack(fill="x", pady=(4, 0))
+
+    tk.Label(
+        validation_row,
+        text=f"Read Value : {validation['read']}",
+        bg=CARD,
+        fg=TEXT,
+        font=("Arial", 10, "bold"),
+        anchor="w",
+        width=28,
+    ).pack(side="left")
+
+    tk.Label(
+        validation_row,
+        text=f"{validation['label']} : {validation['match']}",
+        bg=CARD,
+        fg=TEXT,
+        font=("Arial", 10, "bold"),
+        anchor="w",
+        width=34,
+    ).pack(side="left", padx=(8, 8))
+
+    tk.Label(
+        validation_row,
+        text="Result :",
+        bg=CARD,
+        fg=TEXT,
+        font=("Arial", 10, "bold"),
+        anchor="w",
+    ).pack(side="left", padx=(0, 6))
+
+    make_validation_status_badge(validation_row, validation["status"]).pack(side="left")
+
+
+def show_product_result(product_no, cam1_data, cam2_data):
+    global current_review_context, current_screen_mode
+    current_screen_mode = "result_inner"
+    current_review_context = f"INNER BOX {product_no}/{quantity}"
+    dbg(f"SHOW PRODUCT RESULT product={product_no}/{quantity}")
+
+    show_page(page_result)
+    result_title.config(text=f"OCR Result : Inner Box {product_no} / {quantity}")
+    result_status_badge.config(text="WAIT REVIEW", bg="#f1c40f", fg=TEXT)
+    result_hint.config(text="Review ROI image, OCR result, validation result, then press OK / NEXT to continue.")
+
+    product_result_area.pack(fill="both", expand=True, padx=10, pady=(0, 12))
+    toc_result_area.pack_forget()
+
+    record = build_inner_box_record(product_no, cam1_data, cam2_data, process_dir=current_process_attempt_dir)
+    save_inner_record(record)
+
+    cam1_text = record.get("toa_lot_no", "") or "(empty)"
+    cam2_text = record.get("tob_lot_no", "") or "(empty)"
+
+    # Backward-compatible memory for existing TOC UI validation.
+    if cam1_text and cam1_text != "(empty)":
+        inner_toa_lot_by_index[product_no] = cam1_text
+
+    cam1_roi = cam1_data.get("roi_path", "")
+    cam2_roi = cam2_data.get("roi_path", "")
+
+    vendor_box_status = "PASS" if record["validation"]["rule_1_picking_box_id_eq_vendor_box_id"] in ("PASS", "WAIT_PICKING_BOX_ID") and record["vendor_box_id"] else "WAIT"
+    toa_lot_status = "PASS" if record["validation"]["rule_5_toa_lot_not_duplicate"] == "PASS" and record["toa_lot_no"] else "NG"
+    tob_lot_status = "PASS" if record["validation"]["rule_6_tob_lot_not_duplicate"] == "PASS" and record["tob_lot_no"] else "NG"
+
+    date_status = record["validation"]["rule_3_date_code_match_all"]
+    if date_status == "PASS":
+        date_validation = "Compare : MATCH ALL"
+    else:
+        date_validation = "Compare : NOT MATCH"
+
+    vendor_validation = "WAIT Picking BOX ID" if record["validation"]["rule_1_picking_box_id_eq_vendor_box_id"] == "WAIT_PICKING_BOX_ID" else record["validation"]["rule_1_picking_box_id_eq_vendor_box_id"]
+    toa_validation = record["validation"]["rule_5_toa_lot_not_duplicate"]
+    tob_validation = record["validation"]["rule_6_tob_lot_not_duplicate"]
+
+    update_product_result_section(
+        "vendor",
+        cam1_roi,
+        record["vendor_box_id"] or "(empty)",
+        f"BOX ID : {vendor_validation}",
+        vendor_box_status,
+        cam1_roi,
+        record["vendor_date_code"] or "(empty)",
+        date_validation,
+        date_status,
+    )
+
+    update_product_result_section(
+        "toa",
+        cam1_roi,
+        record["toa_lot_no"] or "(empty)",
+        f"Duplicate : {toa_validation}",
+        toa_lot_status,
+        cam1_roi,
+        record["toa_date_code"] or "(empty)",
+        date_validation,
+        date_status,
+    )
+
+    update_product_result_section(
+        "tob",
+        cam2_roi,
+        record["tob_lot_no"] or "(empty)",
+        f"Duplicate : {tob_validation}",
+        tob_lot_status,
+        cam2_roi,
+        record["tob_date_code"] or "(empty)",
+        date_validation,
+        date_status,
+    )
+
+    # Keep old test JSON output too, so existing debugging folders still work.
+    save_json(record, f"inner_box_{product_no:03d}.json")
+
+
+def show_toc_result(toc_items, fallback_data=None, toc_no=1, toc_total=1):
+    global current_review_context, current_screen_mode
+    current_screen_mode = "result_outer"
+    current_review_context = f"OUTER BOX {toc_no}/{toc_total}"
+    dbg(f"SHOW TOC RESULT outer={toc_no}/{toc_total} items={len(toc_items or [])} fallback={fallback_data is not None}")
+
+    show_page(page_result)
+    result_title.config(text=f"OCR Result : Outer Box {toc_no} / {toc_total}")
+    result_status_badge.config(text="WAIT REVIEW", bg="#f1c40f", fg=TEXT)
+
+    product_result_area.pack_forget()
+    toc_result_area.pack(fill="both", expand=True, padx=10, pady=(0, 12))
+    clear_toc_cards()
+
+    result_hint.config(text="Review TOC ROI, OCR result, and validation result for each row.")
+
+    item_map = {}
+    for item in toc_items or []:
+        name = str(item.get("name", "")).lower()
+        item_map[name] = item
+
+    expected_names = ["toc", "toc1", "toc2", "toc3", "toc4", "toc5", "toc6"]
+    if fallback_data is not None and not item_map:
+        item_map["toc"] = fallback_data
+
+    record = build_outer_box_record(toc_no, toc_total, item_map, fallback_data=fallback_data, process_dir=current_process_attempt_dir)
+    save_outer_record(record)
+
+    for idx, name in enumerate(expected_names, start=1):
+        add_toc_result_row(toc_result_area, row_no=idx, title=name, image_data=item_map.get(name))
+
+    # Keep old test JSON output too, so existing debugging folders still work.
+    save_json(record, f"outer_box_{toc_no:02d}.json")
+
+
+
+# =========================================================
+# T9 SCAN INPUT VALIDATION + DEVICE PRE-CHECK
+# =========================================================
+THAI_DIGIT_MAP = str.maketrans({
+    "๐": "0", "๑": "1", "๒": "2", "๓": "3", "๔": "4",
+    "๕": "5", "๖": "6", "๗": "7", "๘": "8", "๙": "9",
+})
+
+# Thai keyboard layout recovery for the common top-row number keys when the OS layout is Thai.
+THAI_KEYBOARD_RECOVERY = {
+    "ๅ": "1", "/": "2", "-": "3", "ภ": "4", "ถ": "5", "ุ": "6", "ึ": "7", "ค": "8", "ต": "9", "จ": "0",
+    "ๆ": "1", "ไ": "2", "ำ": "3", "พ": "4", "ะ": "5", "ั": "6", "ี": "7", "ร": "8", "น": "9", "ย": "0",
+}
+
+
+def contains_thai(text):
+    return any("\u0E00" <= ch <= "\u0E7F" for ch in str(text or ""))
+
+
+def detect_suffix(raw):
+    raw = str(raw or "")
+    suffixes = []
+    if raw.endswith("\r\n"):
+        suffixes.append("CRLF/ENTER")
+    elif raw.endswith("\n") or raw.endswith("\r"):
+        suffixes.append("ENTER")
+    if raw.endswith("\t"):
+        suffixes.append("TAB")
+    if raw.endswith(" "):
+        suffixes.append("SPACE")
+    return "+".join(suffixes) if suffixes else "NONE"
+
+
+def normalize_scan_input(raw):
+    raw_text = str(raw or "")
+    value = raw_text.translate(THAI_DIGIT_MAP)
+    value = "".join(THAI_KEYBOARD_RECOVERY.get(ch, ch) for ch in value)
+    value = value.replace("\r", "").replace("\n", "").replace("\t", "")
+    value = value.strip().replace(" ", "")
+    value = value.upper()
+    return raw_text, value
+
+
+def validate_en(raw):
+    raw_text, value = normalize_scan_input(raw)
+    errors = []
+    if contains_thai(value):
+        errors.append("EN_CONTAINS_THAI")
+    if not value.isdigit():
+        errors.append("EN_DIGIT_ONLY")
+    if len(value) != 8:
+        errors.append("EN_LENGTH_NOT_8")
+    return {
+        "field": "EN",
+        "raw": raw_text,
+        "normalized": value,
+        "length": len(value),
+        "suffix": detect_suffix(raw_text),
+        "thai_detected": contains_thai(raw_text),
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "time": now_iso(),
+    }
+
+
+def validate_delivery(raw):
+    raw_text, value = normalize_scan_input(raw)
+    errors = []
+    if contains_thai(value):
+        errors.append("DELIVERY_CONTAINS_THAI")
+    if len(value) != 10:
+        errors.append("DELIVERY_LENGTH_NOT_10")
+    if not re.fullmatch(r"[A-Z0-9]{10}", value or ""):
+        errors.append("DELIVERY_ALLOW_ONLY_AZ_09")
+    return {
+        "field": "DELIVERY_NO",
+        "raw": raw_text,
+        "normalized": value,
+        "length": len(value),
+        "suffix": detect_suffix(raw_text),
+        "thai_detected": contains_thai(raw_text),
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "time": now_iso(),
+    }
+
+
+def validate_quantity(raw):
+    raw_text, value = normalize_scan_input(raw)
+    errors = []
+    qty = None
+    if not value.isdigit():
+        errors.append("QTY_INTEGER_ONLY")
+    else:
+        qty = int(value)
+        if qty < 1 or qty > 1000:
+            errors.append("QTY_RANGE_1_1000")
+    return {
+        "field": "QUANTITY",
+        "raw": raw_text,
+        "normalized": value,
+        "length": len(value),
+        "suffix": detect_suffix(raw_text),
+        "thai_detected": contains_thai(raw_text),
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "quantity": qty,
+        "time": now_iso(),
+    }
+
+
+def validate_all_inputs(update_ui=True):
+    global last_input_validation, input_scan_logs
+    result = {
+        "en": validate_en(en_entry.get()),
+        "delivery": validate_delivery(delivery_entry.get()),
+        "quantity": validate_quantity(qty_entry.get()),
+        "time": now_iso(),
+    }
+    result["valid"] = result["en"]["valid"] and result["delivery"]["valid"] and result["quantity"]["valid"]
+    last_input_validation = result
+    input_scan_logs.append(result)
+    if len(input_scan_logs) > 100:
+        input_scan_logs = input_scan_logs[-100:]
+    if update_ui:
+        update_input_validation_ui(result)
+    return result
+
+
+def update_input_validation_ui(result=None):
+    result = result or last_input_validation or {}
+    try:
+        rows = [
+            (input_en_status, result.get("en", {}), globals().get("en_check_label")),
+            (input_delivery_status, result.get("delivery", {}), globals().get("delivery_check_label")),
+            (input_qty_status, result.get("quantity", {}), globals().get("qty_check_label")),
+        ]
+        for label, data, check_label in rows:
+            if not data:
+                label.config(text="WAIT", fg=MUTED)
+                if check_label is not None:
+                    check_label.config(text="○", fg=MUTED)
+                continue
+            if data.get("valid"):
+                label.config(text=f"PASS | {data.get('normalized','')} | Len {data.get('length',0)}", fg=GREEN)
+                if check_label is not None:
+                    check_label.config(text="✓", fg=GREEN)
+            else:
+                label.config(text=f"FAIL | {data.get('normalized','')} | {', '.join(data.get('errors', []))}", fg=RED)
+                if check_label is not None:
+                    check_label.config(text="✕", fg=RED)
+        valid = bool(result.get("valid"))
+        if valid:
+            input_overall_status.config(text="Input Ready", fg=GREEN)
+        else:
+            input_overall_status.config(text="Input Not Ready", fg=RED)
+
+        # Keep START visible at all times. Enable when input is valid; camera pre-check is still executed again on Start.
+        start_btn = globals().get("start_btn")
+        footer_hint = globals().get("footer_hint")
+        if start_btn is not None:
+            if valid:
+                start_btn.config(state="normal", bg=BLUE, fg="white", activebackground=BLUE_DARK)
+            else:
+                start_btn.config(state="disabled", bg="#d6d8db", fg="#6c757d", activebackground="#d6d8db")
+        if footer_hint is not None:
+            footer_hint.config(
+                text="Ready to start. Camera will be checked before job starts." if valid else "Please fill all fields correctly before starting.",
+                fg=GREEN if valid else MUTED,
+            )
+    except Exception:
+        pass
+
+
+def apply_normalized_inputs(validation_result):
+    try:
+        en_entry.delete(0, tk.END)
+        en_entry.insert(0, validation_result["en"]["normalized"])
+        delivery_entry.delete(0, tk.END)
+        delivery_entry.insert(0, validation_result["delivery"]["normalized"])
+        qty_entry.delete(0, tk.END)
+        qty_entry.insert(0, validation_result["quantity"]["normalized"])
+    except Exception:
+        pass
+
+
+def scanner_test_analyze(event=None):
+    try:
+        raw = scanner_test_entry.get()
+        _, normalized = normalize_scan_input(raw)
+        data = {
+            "raw": raw,
+            "normalized": normalized,
+            "length": len(normalized),
+            "suffix": detect_suffix(raw),
+            "thai_detected": contains_thai(raw),
+            "delivery_valid": validate_delivery(raw)["valid"],
+            "en_valid": validate_en(raw)["valid"],
+        }
+        result = "PASS" if data["delivery_valid"] or data["en_valid"] else "FAIL"
+        scanner_test_result_label.config(text=result, fg=GREEN if result == "PASS" else RED)
+        scanner_test_detail_label.config(text=(
+            f"Raw Input      : {repr(data['raw'])}\n"
+            f"Normalized     : {data['normalized']}\n"
+            f"Length         : {data['length']}\n"
+            f"Suffix Detect  : {data['suffix']}\n"
+            f"Thai Detected  : {data['thai_detected']}\n"
+            f"As EN          : {'PASS' if data['en_valid'] else 'FAIL'}\n"
+            f"As Delivery No : {'PASS' if data['delivery_valid'] else 'FAIL'}"
+        ))
+    except Exception as e:
+        print("Scanner test error:", e)
+
+
+def open_scanner_test():
+    global scanner_test_window, scanner_test_entry, scanner_test_result_label, scanner_test_detail_label
+    if scanner_test_window is not None and scanner_test_window.winfo_exists():
+        scanner_test_window.lift()
+        scanner_test_entry.focus()
+        return
+    scanner_test_window = tk.Toplevel(root)
+    scanner_test_window.title("Scanner Test Mode")
+    scanner_test_window.geometry("620x420")
+    scanner_test_window.configure(bg=CARD)
+    scanner_test_window.transient(root)
+
+    tk.Label(scanner_test_window, text="Scanner Test Mode", bg=CARD, fg=TEXT, font=("Arial", 24, "bold")).pack(anchor="w", padx=24, pady=(22, 8))
+    tk.Label(scanner_test_window, text="ยิง Scanner หรือพิมพ์เพื่อทดสอบ Raw / Normalized / Length / Result", bg=CARD, fg=MUTED, font=("Arial", 13)).pack(anchor="w", padx=24, pady=(0, 14))
+
+    scanner_test_entry = tk.Entry(scanner_test_window, font=("Arial", 22), relief="solid", borderwidth=1)
+    scanner_test_entry.pack(fill="x", padx=24, ipady=7)
+    scanner_test_entry.bind("<KeyRelease>", scanner_test_analyze)
+    scanner_test_entry.bind("<Return>", scanner_test_analyze)
+    scanner_test_entry.focus()
+
+    scanner_test_result_label = tk.Label(scanner_test_window, text="WAIT", bg=CARD, fg=MUTED, font=("Arial", 20, "bold"))
+    scanner_test_result_label.pack(anchor="w", padx=24, pady=(16, 4))
+
+    scanner_test_detail_label = tk.Label(scanner_test_window, text="Raw Input      : -\nNormalized     : -\nLength         : -\nSuffix Detect  : -\nThai Detected  : -\nAs EN          : -\nAs Delivery No : -", bg="#f7f9fa", fg=TEXT, font=("Consolas", 13), justify="left", anchor="nw", padx=14, pady=14)
+    scanner_test_detail_label.pack(fill="both", expand=True, padx=24, pady=(0, 18))
+
+
+def quick_check_picam(index, name):
+    cam = None
+    try:
+        cam = PiCameraTest(index=index, name=name, status_cb=lambda text: None, preview_cb=lambda frame, is_bgr=False: None)
+        cam.open()
+        cam.close()
+        return True, "OK"
+    except Exception as e:
+        try:
+            if cam is not None:
+                cam.close()
+        except Exception:
+            pass
+        return False, str(e)
+
+
+def quick_check_usb_device(device):
+    cap = None
+    try:
+        dev_path = f"/dev/video{device}"
+        cap = cv2.VideoCapture(dev_path, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            return False, "not opened"
+        ret, _ = cap.read()
+        cap.release()
+        return bool(ret), "OK" if ret else "opened but cannot read frame"
+    except Exception as e:
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:
+            pass
+        return False, str(e)
+
+
+def precheck_cameras():
+    global resolved_usb_device, USB_DEVICE
+    results = {
+        "cam1": {"name": "CAM1", "device": PICAM1_INDEX, "ok": False, "message": ""},
+        "cam2": {"name": "CAM2", "device": PICAM2_INDEX, "ok": False, "message": ""},
+        "cam3": {"name": "CAM3 USB", "device": None, "ok": False, "message": ""},
+    }
+
+    ok1, msg1 = quick_check_picam(PICAM1_INDEX, "CAM1_PRECHECK")
+    results["cam1"].update({"ok": ok1, "message": msg1})
+
+    ok2, msg2 = quick_check_picam(PICAM2_INDEX, "CAM2_PRECHECK")
+    results["cam2"].update({"ok": ok2, "message": msg2})
+
+    usb_messages = []
+    resolved_usb_device = None
+    for dev in USB_DEVICE_CANDIDATES:
+        ok, msg = quick_check_usb_device(dev)
+        usb_messages.append(f"{dev}: {'OK' if ok else msg}")
+        if ok and resolved_usb_device is None:
+            resolved_usb_device = dev
+            break
+
+    if resolved_usb_device is not None:
+        USB_DEVICE = resolved_usb_device
+        results["cam3"].update({"ok": True, "device": resolved_usb_device, "message": f"OK /dev/video{resolved_usb_device}"})
+    else:
+        results["cam3"].update({"ok": False, "message": "; ".join(usb_messages)})
+
+    return results
+
+
+def show_camera_precheck_result(results):
+    lines = []
+    all_ok = True
+    for key in ["cam1", "cam2", "cam3"]:
+        r = results[key]
+        status = "PASS" if r["ok"] else "FAIL"
+        all_ok = all_ok and r["ok"]
+        lines.append(f"{r['name']} : {status} | Device {r.get('device')} | {r.get('message','')}")
+    text = "\n".join(lines)
+    try:
+        camera_precheck_status.config(text=text, fg=GREEN if all_ok else RED)
+    except Exception:
+        pass
+    return all_ok, text
+
+
+def run_camera_precheck_button():
+    set_status("Camera pre-check running...")
+    results = precheck_cameras()
+    all_ok, text = show_camera_precheck_result(results)
+    messagebox.showinfo("Camera Pre-check", text if all_ok else "Camera not ready:\n" + text)
+    set_status("Camera pre-check PASS" if all_ok else "Camera pre-check FAIL")
+
+
+# =========================================================
+# JOB FLOW
+# =========================================================
+def start_job():
+    global running, en_no, delivery_no, quantity, current_index, current_outer_index, outer_total, item_no, action_value, inner_toa_lot_by_index
+
+    validation_result = validate_all_inputs(update_ui=True)
+    if not validation_result.get("valid"):
+        messagebox.showwarning(
+            "Input Validation Failed",
+            "Please check input values before Start.\n\n"
+            f"EN: {validation_result['en'].get('errors', [])}\n"
+            f"Delivery: {validation_result['delivery'].get('errors', [])}\n"
+            f"Quantity: {validation_result['quantity'].get('errors', [])}"
+        )
+        return
+
+    apply_normalized_inputs(validation_result)
+
+    set_status("Camera pre-check running...")
+    camera_results = precheck_cameras()
+    cameras_ok, camera_text = show_camera_precheck_result(camera_results)
+    if not cameras_ok:
+        messagebox.showerror("Camera Pre-check Failed", "Camera not ready. Job cannot start.\n\n" + camera_text)
+        set_status("Camera pre-check FAIL")
+        return
+
+    en_no = validation_result["en"]["normalized"]
+    delivery_no = validation_result["delivery"]["normalized"]
+    qty_text = validation_result["quantity"]["normalized"]
+    item_no = "-"
+    quantity = int(qty_text)
+
+    outer_total = math.ceil(quantity / 6)
+    inner_toa_lot_by_index = {}
+    current_index = 0
+    current_outer_index = 0
+    running = True
+    clear_action()
+    init_job_data()
+
+    dbg("START JOB")
+    setup_capture_page(mode="inner", active="TOA", done=[])
+    set_status("Loading OCR Model...")
+
+    thread = threading.Thread(target=job_loop, daemon=True)
+    thread.start()
+
+
+def job_loop():
+    global current_index, running
+
+    root.after(0, lambda: set_status("Loading OCR Model..."))
+    load_ocr()
+    root.after(0, lambda: set_status("OCR Ready"))
+
+    for i in range(1, quantity + 1):
+        if not running:
+            return
+
+        current_index = i
+        root.after(0, lambda i=i: setup_capture_page(mode="inner", active="TOA", done=[]))
+
+        ok = process_product(i)
+        if not ok:
+            if action_value == "cancel":
+                root.after(0, reset_to_input)
+            else:
+                fail_job_data("inner_process_failed")
+            running = False
+            return
+
+        sleep(0.4)
+
+    running = False
+    root.after(0, lambda: show_page(page_ready_toc))
+
+
+def process_product(product_no):
+    global current_camera
+
+    while running:
+        clear_action()
+        inner_ref = f"INNER_{product_no:03d}"
+        process_dir = next_process_attempt_dir("inner", inner_ref)
+        root.after(0, lambda: setup_capture_page(mode="inner", active="TOA", done=[]))
+        root.after(0, lambda: set_step("CAM1 : Detect object by background"))
+        root.after(0, lambda: set_status("CAM1 opening"))
+
+        cam1_path = os.path.join(process_dir, now_name(f"cam1_inner{product_no}"))
+        cam2_path = os.path.join(process_dir, now_name(f"cam2_inner{product_no}"))
+
+        # ===================== CAM1 =====================
+        cam1 = PiCameraTest(index=PICAM1_INDEX, name="CAM1", status_cb=set_status, preview_cb=update_preview)
+        current_camera = cam1
+        try:
+            cam1.open()
+            bg = cam1.wait_background(current_process_alive)
+            if bg is None:
+                cam1.close()
+                current_camera = None
+                if action_value == "restart":
+                    finalize_process_attempt("reset", {"reason": "operator_reset"})
+                    continue
+                return False
+
+            detected = cam1.wait_object(bg, current_process_alive)
+            if not detected:
+                cam1.close()
+                current_camera = None
+                if action_value == "restart":
+                    finalize_process_attempt("reset", {"reason": "operator_reset"})
+                    continue
+                return False
+
+            cam1.focus_delay(current_process_alive)
+            if action_value is not None or not running:
+                cam1.close()
+                current_camera = None
+                if action_value == "restart":
+                    finalize_process_attempt("reset", {"reason": "operator_reset"})
+                    continue
+                return False
+
+            cam1.capture_file(cam1_path)
+            add_process_image(cam1_path, "CAM1_VENDOR_TOA_FULL")
+        except Exception as e:
+            root.after(0, lambda e=e: messagebox.showerror("CAM1 Error", str(e)))
+            if action_value == "restart":
+                finalize_process_attempt("reset", {"reason": "operator_reset"})
+                continue
+            return False
+        finally:
+            try:
+                cam1.close()
+            except Exception:
+                pass
+            current_camera = None
+
+        # ===================== CAM2 =====================
+        if not running:
+            return False
+        if action_value == "restart":
+            finalize_process_attempt("reset", {"reason": "operator_reset"})
+            continue
+
+        root.after(0, lambda: setup_capture_page(mode="inner", active="TOB", done=["TOA"]))
+        root.after(0, lambda: set_step("CAM2 : Capture directly"))
+        root.after(0, lambda: set_status("CAM2 opening"))
+
+        cam2 = PiCameraTest(index=PICAM2_INDEX, name="CAM2", status_cb=set_status, preview_cb=update_preview)
+        current_camera = cam2
+        try:
+            cam2.open()
+            cam2.focus_delay(current_process_alive)
+            if action_value is not None or not running:
+                cam2.close()
+                current_camera = None
+                if action_value == "restart":
+                    finalize_process_attempt("reset", {"reason": "operator_reset"})
+                    continue
+                return False
+            cam2.capture_file(cam2_path)
+            add_process_image(cam2_path, "CAM2_TOB_FULL")
+        except Exception as e:
+            root.after(0, lambda e=e: messagebox.showerror("CAM2 Error", str(e)))
+            if action_value == "restart":
+                finalize_process_attempt("reset", {"reason": "operator_reset"})
+                continue
+            return False
+        finally:
+            try:
+                cam2.close()
+            except Exception:
+                pass
+            current_camera = None
+
+        # ===================== OCR + REVIEW =====================
+        if not running:
+            return False
+        if action_value == "restart":
+            finalize_process_attempt("reset", {"reason": "operator_reset"})
+            continue
+
+        root.after(0, lambda: set_step("OCR : Center ROI CAM1/CAM2"))
+        root.after(0, lambda: set_status("OCR reading"))
+
+        cam1_data = process_center_roi_ocr(cam1_path, "cam1")
+        cam2_data = process_center_roi_ocr(cam2_path, "cam2")
+
+        clear_action()
+        root.after(0, lambda: setup_capture_page(mode="inner", active=None, done=["TOA", "TOB"]))
+        root.after(0, lambda: show_product_result(product_no, cam1_data, cam2_data))
+
+        action = wait_review_action(f"Inner Box {product_no}/{quantity}")
+        if action == "next":
+            finalize_process_attempt("final", {"reason": "operator_ok_next"})
+            return True
+        if action == "restart":
+            finalize_process_attempt("reset", {"reason": "operator_reset_after_review"})
+            continue
+        return False
+
+    return False
+
+
+def continue_toc():
+    global running, current_outer_index
+
+    running = True
+    current_outer_index = 0
+    clear_action()
+    dbg("CONTINUE TOC")
+
+    setup_capture_page(mode="outer", active="TOC", done=["TOA", "TOB"])
+    thread = threading.Thread(target=toc_loop, daemon=True)
+    thread.start()
+
+
+def toc_loop():
+    global running, current_outer_index
+
+    dbg(f"TOC LOOP START quantity={quantity} outer_total={outer_total}")
+
+    for toc_no in range(1, outer_total + 1):
+        if not running:
+            return
+
+        current_outer_index = toc_no
+        root.after(0, lambda: setup_capture_page(mode="outer", active="TOC", done=["TOA", "TOB"]))
+
+        ok = process_toc(toc_no=toc_no, toc_total=outer_total)
+        if not ok:
+            if action_value == "cancel":
+                root.after(0, reset_to_input)
+            else:
+                fail_job_data("outer_process_failed")
+            running = False
+            return
+
+        sleep(0.4)
+
+    running = False
+    finish_job_data()
+    root.after(0, lambda: show_page(page_complete))
+
+
+def process_toc(toc_no=1, toc_total=1):
+    global current_camera
+
+    while running:
+        clear_action()
+        toc_ref = f"TOC_{toc_no:03d}"
+        process_dir = next_process_attempt_dir("outer", toc_ref)
+        root.after(0, lambda: setup_capture_page(mode="outer", active="TOC", done=["TOA", "TOB"]))
+        root.after(0, lambda: set_step(f"CAM3 : Outer Box {toc_no}/{toc_total} YOLO detect -> capture -> crop ROI -> OCR"))
+        root.after(0, lambda: set_status(f"CAM3 opening Outer Box {toc_no}/{toc_total}"))
+
+        toc_path = os.path.join(process_dir, now_name(f"cam3_outer{toc_no}"))
+        cam3 = UsbCameraTest(device=USB_DEVICE, name="CAM3", status_cb=set_status, preview_cb=update_preview)
+        current_camera = cam3
+
+        try:
+            cam3.open()
+            capture_result = cam3.capture_direct_or_yolo(toc_path, current_process_alive)
+            if not capture_result:
+                cam3.close()
+                current_camera = None
+                if action_value == "restart":
+                    finalize_process_attempt("reset", {"reason": "operator_reset"})
+                    continue
+                return False
+        except Exception as e:
+            root.after(0, lambda e=e: messagebox.showerror("CAM3 Error", str(e)))
+            if action_value == "restart":
+                finalize_process_attempt("reset", {"reason": "operator_reset"})
+                continue
+            return False
+        finally:
+            try:
+                cam3.close()
+            except Exception:
+                pass
+            current_camera = None
+
+        if not running:
+            return False
+        if action_value == "restart":
+            finalize_process_attempt("reset", {"reason": "operator_reset"})
+            continue
+
+        image_path = capture_result["image_path"]
+        add_process_image(image_path, "CAM3_TOC_FULL")
+        detections = capture_result.get("detections", [])
+
+        root.after(0, lambda: set_step(f"Outer Box {toc_no}/{toc_total} OCR : YOLO ROI count = {len(detections)}"))
+        root.after(0, lambda: set_status(f"Outer Box {toc_no}/{toc_total} OCR reading from YOLO ROI"))
+
+        toc_items = process_yolo_roi_ocr(image_path, detections)
+        fallback = None
+        if not toc_items:
+            root.after(0, lambda: set_status("No YOLO ROI OCR, fallback center ROI"))
+            fallback = process_center_roi_ocr(image_path, f"toc_center_{toc_no}")
+
+        clear_action()
+        root.after(0, lambda: setup_capture_page(mode="outer", active=None, done=["TOA", "TOB", "TOC"]))
+        root.after(0, lambda: show_toc_result(toc_items, fallback, toc_no, toc_total))
+
+        action = wait_review_action(f"Outer Box {toc_no}/{toc_total}")
+        if action == "next":
+            finalize_process_attempt("final", {"reason": "operator_ok_next"})
+            return True
+        if action == "restart":
+            finalize_process_attempt("reset", {"reason": "operator_reset_after_review"})
+            continue
+        return False
+
+    return False
+
+
+def wait_review_action(context="-"):
+    global debug_wait_counter
+
+    debug_wait_counter += 1
+    wait_id = debug_wait_counter
+    dbg(f"WAIT[{wait_id}] ENTER context={context}")
+    last_log = time.time()
+
+    while running and not action_event.is_set():
+        now = time.time()
+        if now - last_log >= 1.0:
+            dbg(f"WAIT[{wait_id}] still waiting context={context}")
+            last_log = now
+        sleep(0.1)
+
+    action = action_value or "cancel"
+    dbg(f"WAIT[{wait_id}] EXIT context={context} action={action} running={running}")
+    return action
+
+
+def on_result_ok():
+    dbg(f"OK/NEXT pressed on {current_review_context}")
+    set_action("next")
+
+
+def restart_process():
+    # Keep current Inner Box / Outer Box index. Only redo current capture + OCR.
+    dbg(f"Restart The Process pressed on {current_screen_mode}")
+    set_action("restart")
+
+
+def cancel_job():
+    dbg("Cancel Job pressed")
+    # Design V2: Cancel ends entire job, but existing attempt/images/OCR must be saved.
+    if current_process_attempt_dir:
+        finalize_process_attempt("reset", {"reason": "operator_cancel_before_final"})
+    if job_data:
+        job_data["cancelled_at"] = now_iso()
+        job_data.setdefault("events", []).append({
+            "time": job_data["cancelled_at"],
+            "event": "JOB_CANCELLED",
+            "status": "CANCELLED",
+            "cancel_reason": "operator_cancel",
+        })
+        finalize_attempt_status("CANCELLED", "operator_cancel")
+    set_action("cancel")
+    root.after(0, reset_to_input)
+
+
+def reset_to_input():
+    global running, current_index, current_outer_index, delivery_no, en_no, quantity, outer_total, inner_toa_lot_by_index, job_id, job_started_at, job_storage_dir, job_data
+    global delivery_storage_dir, attempt_storage_dir, attempt_no, attempt_status, process_attempt_counter, current_process_attempt_dir, current_process_attempt_meta
+
+    running = False
+    clear_action()
+    current_index = 0
+    current_outer_index = 0
+    quantity = 0
+    outer_total = 0
+    inner_toa_lot_by_index = {}
+    delivery_no = ""
+    en_no = ""
+    job_id = ""
+    job_started_at = ""
+    job_storage_dir = ""
+    job_data = {}
+    delivery_storage_dir = ""
+    attempt_storage_dir = ""
+    attempt_no = 0
+    attempt_status = ""
+    process_attempt_counter = {}
+    current_process_attempt_dir = ""
+    current_process_attempt_meta = {}
+
+    try:
+        en_entry.delete(0, tk.END)
+        delivery_entry.delete(0, tk.END)
+        qty_entry.delete(0, tk.END)
+    except Exception:
+        pass
+
+    show_page(page_input)
+
+
+def exit_app():
+    global running
+    if running and job_data:
+        if current_process_attempt_dir:
+            finalize_process_attempt("reset", {"reason": "app_exit"})
+        job_data.setdefault("events", []).append({
+            "time": now_iso(),
+            "event": "APP_EXIT_DURING_JOB",
+            "status": "CANCELLED",
+            "cancel_reason": "app_exit",
+        })
+        finalize_attempt_status("CANCELLED", "app_exit")
+    running = False
+    try:
+        if current_camera is not None:
+            current_camera.close()
+    except Exception:
+        pass
+    root.destroy()
+
+
+def on_close():
+    exit_app()
+
+
+# =========================================================
+# UI
+# =========================================================
+root = tk.Tk()
+root.title("AI Camera TEST UI - YOLO ROI OCR - T10 Input UI")
+root.geometry("1200x720")
+root.resizable(False, False)
+
+# ===================== THEME =====================
+BG = "#eef3f7"
+CARD = "#ffffff"
+TEXT = "#17202a"
+MUTED = "#6c7a89"
+BLUE = "#0b5cab"
+BLUE_DARK = "#084b8a"
+RED = "#c0392b"
+RED_DARK = "#922b21"
+BORDER = "#dfe6e9"
+SOFT = "#f7f9fa"
+GREEN = "#229954"
+GREEN_BG = "#eafaf1"
+YELLOW_TEXT = "#b9770e"
+YELLOW_BG = "#fff3cd"
+DARK = "#17202a"
+
+root.configure(bg=BG)
+
+# ===================== ICONS =====================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ICON_DIR = os.path.join(BASE_DIR, "assets", "icons")
+icons = {}
+
+
+def load_icon_file(filename, size=(28, 28)):
+    path = os.path.join(ICON_DIR, filename)
+    if not os.path.exists(path):
+        return None
+    try:
+        img = Image.open(path).convert("RGBA")
+        try:
+            img = img.resize(size, Image.Resampling.LANCZOS)
+        except Exception:
+            img = img.resize(size)
+        return ImageTk.PhotoImage(img)
+    except Exception as e:
+        print("Icon load error:", path, e)
+        return None
+
+
+def load_icons():
+    icons["lot"] = load_icon_file("assignment.png")
+    icons["delivery"] = load_icon_file("description.png")
+    icons["barcode"] = load_icon_file("label.png")
+    icons["progress"] = load_icon_file("analytics.png")
+    icons["pack"] = load_icon_file("package.png")
+    icons["camera"] = load_icon_file("photo.png")
+    icons["status"] = load_icon_file("dashboard.png")
+    icons["check"] = load_icon_file("checklist.png")
+    icons["setting"] = load_icon_file("settings.png")
+    icons["info"] = load_icon_file("info.png")
+    icons["cancel"] = load_icon_file("cancel.png")
+    icons["stop"] = load_icon_file("stop.png")
+    icons["refresh"] = load_icon_file("refresh.png")
+
+
+def icon_label(parent, key, bg=CARD):
+    icon = icons.get(key)
+    if icon is not None:
+        return tk.Label(parent, image=icon, bg=bg)
+    return tk.Label(parent, text=key.upper()[:4], bg=SOFT, fg=BLUE, font=("Arial", 8, "bold"), width=5, height=2)
+
+
+def title_with_icon(parent, icon_key, text, bg=CARD):
+    frame = tk.Frame(parent, bg=bg)
+    frame.pack(fill="x")
+    icon_label(frame, icon_key, bg=bg).pack(side="left", padx=(0, 10))
+    tk.Label(frame, text=text, bg=bg, fg=TEXT, font=("Arial", 22, "bold")).pack(side="left")
+    return frame
+
+
+def flat_button(parent, text, bg, fg="white", command=None, icon_key=None, width=None):
+    kwargs = {
+        "text": text,
+        "bg": bg,
+        "fg": fg,
+        "activebackground": RED_DARK if bg == RED else BLUE_DARK,
+        "activeforeground": "white",
+        "font": ("Arial", 10, "bold"),
+        "relief": "flat",
+        "command": command,
+        "cursor": "hand2",
+        "padx": 10,
+        "pady": 5,
+    }
+    if width is not None:
+        kwargs["width"] = width
+    icon = icons.get(icon_key) if icon_key else None
+    if icon is not None:
+        kwargs["image"] = icon
+        kwargs["compound"] = "left"
+    return tk.Button(parent, **kwargs)
+
+
+def add_action_button(parent, text, bg, fg="white", command=None, width_px=190, height_px=44, frame_bg=None):
+    """Create same-size action buttons so Restart / Cancel / OK are aligned."""
+    if frame_bg is None:
+        frame_bg = parent.cget("bg")
+    wrap = tk.Frame(parent, bg=frame_bg, width=width_px, height=height_px)
+    wrap.pack(side="left", padx=(0, 8))
+    wrap.pack_propagate(False)
+
+    active_bg = RED_DARK if bg == RED else ("#1e8449" if bg == "#27ae60" else "#aeb4b8")
+    btn = tk.Button(
+        wrap,
+        text=text,
+        bg=bg,
+        fg=fg,
+        activebackground=active_bg,
+        activeforeground="white" if fg == "white" else fg,
+        font=("Arial", 14, "bold"),
+        relief="flat",
+        cursor="hand2",
+        command=command,
+        padx=0,
+        pady=0,
+    )
+    btn.pack(fill="both", expand=True)
+    return btn
+
+
+load_icons()
+
+top = tk.Frame(root, bg=BG, height=1)
+top.pack(side="top", fill="x")
+top.pack_propagate(False)
+
+# Placeholder labels
+info_delivery = tk.Label(root)
+info_item = tk.Label(root)
+info_en = tk.Label(root)
+info_box_title = tk.Label(root)
+info_box = tk.Label(root)
+info_pack = tk.Label(root)
+progress_title_label = tk.Label(root)
+progress_label = tk.Label(root)
+progress_percent_label = tk.Label(root)
+status_label = tk.Label(root)
+step_label = tk.Label(root)
+
+# =========================================================
+# PAGE 1: INPUT
+# =========================================================
+page_input = tk.Frame(root, bg=BG)
+
+# Main centered card: compact input area, like the approved mockup.
+input_card = tk.Frame(
+    page_input,
+    bg=CARD,
+    padx=54,
+    pady=34,
+    highlightbackground=BORDER,
+    highlightthickness=1,
+)
+input_card.place(relx=0.5, rely=0.43, anchor="center", width=720, height=525)
+
+tk.Label(input_card, text="Start Test Job", font=("Arial", 30, "bold"), bg=CARD, fg=TEXT).pack(anchor="w", pady=(0, 20))
+
+
+def make_compact_input(parent, title):
+    row = tk.Frame(parent, bg=CARD)
+    row.pack(fill="x", pady=(0, 15))
+
+    tk.Label(row, text=title, bg=CARD, fg=TEXT, font=("Arial", 13, "bold")).pack(anchor="w", pady=(0, 5))
+
+    input_line = tk.Frame(row, bg=CARD)
+    input_line.pack(fill="x")
+
+    ent = tk.Entry(input_line, font=("Arial", 18), relief="solid", borderwidth=1)
+    ent.pack(side="left", fill="x", expand=True, ipady=7)
+
+    check = tk.Label(input_line, text="○", bg=CARD, fg=MUTED, font=("Arial", 22, "bold"), width=3)
+    check.pack(side="left", padx=(12, 0))
+    return ent, check
+
+
+en_entry, en_check_label = make_compact_input(input_card, "EN   (8 digits / scanner or manual)")
+delivery_entry, delivery_check_label = make_compact_input(input_card, "Delivery NO   (10 chars A-Z / 0-9)")
+qty_entry, qty_check_label = make_compact_input(input_card, "Quantity   (1-1000)")
+
+# T10 compact validation status
+input_status_frame = tk.Frame(input_card, bg=CARD)
+input_status_frame.pack(fill="x", pady=(0, 10))
+input_en_status = tk.Label(input_status_frame, text="EN : WAIT", bg=CARD, fg=MUTED, font=("Arial", 10, "bold"), anchor="w")
+input_en_status.pack(fill="x")
+input_delivery_status = tk.Label(input_status_frame, text="Delivery : WAIT", bg=CARD, fg=MUTED, font=("Arial", 10, "bold"), anchor="w")
+input_delivery_status.pack(fill="x")
+input_qty_status = tk.Label(input_status_frame, text="Quantity : WAIT", bg=CARD, fg=MUTED, font=("Arial", 10, "bold"), anchor="w")
+input_qty_status.pack(fill="x")
+input_overall_status = tk.Label(input_status_frame, text="Input Not Ready", bg=CARD, fg=RED, font=("Arial", 11, "bold"), anchor="w")
+input_overall_status.pack(fill="x", pady=(3, 0))
+
+camera_precheck_status = tk.Label(
+    input_card,
+    text="Camera Pre-check :   WAIT",
+    bg="#f7f9fa",
+    fg=MUTED,
+    font=("Consolas", 10, "bold"),
+    justify="left",
+    anchor="w",
+    padx=10,
+    pady=7,
+)
+camera_precheck_status.pack(fill="x", pady=(0, 12))
+
+util_btn_row = tk.Frame(input_card, bg=CARD)
+util_btn_row.pack(fill="x", pady=(0, 0))
+tk.Button(
+    util_btn_row,
+    text="▥  SCANNER TEST",
+    font=("Arial", 12, "bold"),
+    bg="#dfe6e9",
+    fg=TEXT,
+    activebackground="#cfd8dc",
+    activeforeground=TEXT,
+    relief="flat",
+    command=open_scanner_test,
+).pack(side="left", fill="x", expand=True, ipady=9, padx=(0, 8))
+tk.Button(
+    util_btn_row,
+    text="▣  CAMERA PRE-CHECK",
+    font=("Arial", 12, "bold"),
+    bg="#dfe6e9",
+    fg=TEXT,
+    activebackground="#cfd8dc",
+    activeforeground=TEXT,
+    relief="flat",
+    command=run_camera_precheck_button,
+).pack(side="left", fill="x", expand=True, ipady=9, padx=(8, 0))
+
+# Footer bar: Start / Exit are always visible and cannot be pushed out by input content.
+footer_bar = tk.Frame(page_input, bg="#f8fafc", highlightbackground=BORDER, highlightthickness=1, height=108)
+footer_bar.pack(side="bottom", fill="x")
+footer_bar.pack_propagate(False)
+
+exit_btn = tk.Button(
+    footer_bar,
+    text="↩   EXIT APP",
+    font=("Arial", 14, "bold"),
+    bg="#eef2f5",
+    fg=TEXT,
+    activebackground="#dde5ea",
+    activeforeground=TEXT,
+    relief="solid",
+    borderwidth=1,
+    command=exit_app,
+)
+exit_btn.pack(side="left", padx=34, pady=28, ipadx=35, ipady=10)
+
+footer_hint = tk.Label(
+    footer_bar,
+    text="Please fill all fields correctly before starting.",
+    bg="#f8fafc",
+    fg=MUTED,
+    font=("Arial", 13, "bold"),
+)
+footer_hint.pack(side="left", expand=True)
+
+start_btn = tk.Button(
+    footer_bar,
+    text="▶   START JOB",
+    font=("Arial", 14, "bold"),
+    bg="#d6d8db",
+    fg="#6c757d",
+    disabledforeground="#6c757d",
+    activebackground=BLUE_DARK,
+    activeforeground="white",
+    relief="flat",
+    command=start_job,
+    state="disabled",
+)
+start_btn.pack(side="right", padx=34, pady=28, ipadx=42, ipady=12)
+
+for _entry in [en_entry, delivery_entry, qty_entry]:
+    _entry.bind("<KeyRelease>", lambda e: validate_all_inputs(update_ui=True))
+
+en_entry.bind("<Return>", lambda e: delivery_entry.focus())
+delivery_entry.bind("<Return>", lambda e: qty_entry.focus())
+qty_entry.bind("<Return>", lambda e: start_job())
+en_entry.focus()
+
+# Initial status paint
+try:
+    validate_all_inputs(update_ui=True)
+except Exception:
+    pass
+
+# =========================================================
+# PAGE 2/4: CAPTURE
+# =========================================================
+page_capture = tk.Frame(root, bg=BG)
+capture_container = tk.Frame(page_capture, bg=BG)
+capture_container.pack(fill="both", expand=True, padx=14, pady=14)
+
+# Section 1 header
+header_frame = tk.Frame(capture_container, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=30, pady=36)
+header_frame.pack(fill="x", pady=(0, 12))
+
+header_top = tk.Frame(header_frame, bg=CARD)
+header_top.pack(fill="x")
+
+info_left = tk.Frame(header_top, bg=CARD)
+info_left.pack(side="left", fill="x", expand=True)
+
+header_buttons = tk.Frame(header_top, bg=CARD)
+header_buttons.pack(side="right")
+
+add_action_button(header_buttons, "Restart The Process", bg="#bfc3c7", fg=TEXT, command=restart_process, width_px=205, height_px=58)
+add_action_button(header_buttons, "Cancel Job", bg=RED, fg="white", command=cancel_job, width_px=205, height_px=58)
+add_action_button(header_buttons, "OK / NEXT", bg="#27ae60", fg="white", command=on_result_ok, width_px=205, height_px=58)
+
+info_row1 = tk.Frame(info_left, bg=CARD)
+info_row1.pack(fill="x", pady=(0, 28))
+info_row2 = tk.Frame(info_left, bg=CARD)
+info_row2.pack(fill="x")
+
+
+def header_info_inline(parent, icon_key, title, value_width=18):
+    """Header row 1: icon + title and value on the same line."""
+    box = tk.Frame(parent, bg=CARD)
+    box.pack(side="left", padx=(0, 74))
+
+    icon_label(box, icon_key, bg=CARD).pack(side="left", padx=(0, 8))
+
+    tk.Label(
+        box,
+        text=f"{title} :",
+        bg=CARD,
+        fg=MUTED,
+        font=("Arial", 22, "bold"),
+        anchor="w"
+    ).pack(side="left")
+
+    val = tk.Label(
+        box,
+        text="-",
+        bg=CARD,
+        fg=TEXT,
+        font=("Arial", 25, "bold"),
+        width=value_width,
+        anchor="w"
+    )
+    val.pack(side="left", padx=(10, 0))
+    return val
+
+
+def header_info_box(parent, icon_key, title, value_width=16):
+    box = tk.Frame(parent, bg=CARD)
+    box.pack(side="left", padx=(0, 70))
+
+    icon_label(box, icon_key, bg=CARD).pack(side="left", padx=(0, 8), anchor="n")
+
+    text_box = tk.Frame(box, bg=CARD)
+    text_box.pack(side="left")
+
+    tk.Label(
+        text_box,
+        text=title,
+        bg=CARD,
+        fg=MUTED,
+        font=("Arial", 21, "bold"),
+        anchor="w"
+    ).pack(anchor="w")
+
+    val = tk.Label(
+        text_box,
+        text="-",
+        bg=CARD,
+        fg=TEXT,
+        font=("Arial", 25, "bold"),
+        width=value_width,
+        anchor="w"
+    )
+    val.pack(anchor="w", pady=(6, 0))
+    return val
+
+
+info_delivery = header_info_inline(info_row1, "delivery", "Delivary No", 18)
+info_item = header_info_inline(info_row1, "barcode", "Item No", 10)
+info_en = header_info_box(info_row2, "barcode", "EN", 10)
+
+inner_box_container = tk.Frame(info_row2, bg=CARD)
+inner_box_container.pack(side="left", padx=(0, 70))
+icon_label(inner_box_container, "progress", bg=CARD).pack(side="left", padx=(0, 8), anchor="n")
+info_box_text = tk.Frame(inner_box_container, bg=CARD)
+info_box_text.pack(side="left")
+info_box_title = tk.Label(info_box_text, text="Inner Box", bg=CARD, fg=MUTED, font=("Arial", 21, "bold"), anchor="w")
+info_box_title.pack(anchor="w")
+info_box = tk.Label(info_box_text, text="-", bg=CARD, fg=TEXT, font=("Arial", 25, "bold"), width=10, anchor="w")
+info_box.pack(anchor="w", pady=(6, 0))
+
+info_pack = header_info_box(info_row2, "pack", "Pack Type", 10)
+
+# Body
+body_frame = tk.Frame(capture_container, bg=BG)
+body_frame.pack(fill="both", expand=True)
+
+# Section 2 capture left
+capture_left = tk.Frame(body_frame, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=12, pady=14, width=800)
+capture_left.pack(side="left", fill="both", expand=False, padx=(0, 10))
+capture_left.pack_propagate(False)
+
+title_with_icon(capture_left, "camera", "Capture Images", bg=CARD)
+tk.Label(capture_left, text="Preview", bg=CARD, fg=MUTED, font=("Arial", 14, "bold")).pack(anchor="w", pady=(8, 4))
+
+preview_frame = tk.Frame(capture_left, bg=DARK, width=760, height=430, highlightbackground=DARK, highlightthickness=2)
+preview_frame.pack(pady=(4, 10))
+preview_frame.pack_propagate(False)
+
+preview_label = tk.Label(preview_frame, text="Camera Preview", bg=DARK, fg="white", font=("Arial", 20))
+preview_label.place(x=0, y=0, relwidth=1, relheight=1)
+
+preview_overlay = tk.Frame(preview_frame, bg=DARK)
+preview_overlay.place(x=10, y=8)
+
+capture_state_dot = tk.Canvas(preview_overlay, width=14, height=14, bg=DARK, highlightthickness=0)
+capture_state_dot.pack(side="left", padx=(0, 5))
+capture_state_dot.create_oval(2, 2, 12, 12, fill="#f1c40f", outline="#f1c40f")
+
+capture_state_label = tk.Label(preview_overlay, text="Waiting Object", bg=DARK, fg="white", font=("Arial", 14, "bold"), padx=2, pady=2)
+capture_state_label.pack(side="left")
+
+reset_btn = tk.Button(capture_left, text="Restart The Process", bg="#dfe6e9", fg=TEXT, activebackground="#cfd8dc", activeforeground=TEXT, font=("Arial", 13, "bold"), relief="flat", height=2, cursor="hand2", command=restart_process)
+if icons.get("refresh") is not None:
+    reset_btn.config(image=icons["refresh"], compound="left")
+reset_btn.pack(fill="x", pady=(8, 0))
+
+# Section 3 right status
+capture_right = tk.Frame(body_frame, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=22, pady=18)
+capture_right.pack(side="right", fill="both", expand=True)
+
+title_with_icon(capture_right, "status", "Status", bg=CARD)
+
+product_header = tk.Frame(capture_right, bg=CARD)
+product_header.pack(fill="x", pady=(18, 2))
+icon_label(product_header, "pack", bg=CARD).pack(side="left", padx=(0, 8))
+progress_title_label = tk.Label(product_header, text="Inner Box", bg=CARD, fg=TEXT, font=("Arial", 18, "bold"))
+progress_title_label.pack(side="left")
+
+product_row = tk.Frame(capture_right, bg=CARD)
+product_row.pack(fill="x")
+progress_label = tk.Label(product_row, text="0 / 0", bg=CARD, fg=TEXT, font=("Arial", 19, "bold"))
+progress_label.pack(side="left")
+progress_percent_label = tk.Label(product_row, text="0%", bg=CARD, fg=TEXT, font=("Arial", 17, "bold"))
+progress_percent_label.pack(side="right")
+
+progress_bar_bg = tk.Frame(capture_right, bg="#c4c4c8", height=26)
+progress_bar_bg.pack(fill="x", pady=(4, 20))
+progress_bar_bg.pack_propagate(False)
+progress_bar_fill = tk.Frame(progress_bar_bg, bg=BLUE)
+progress_bar_fill.place(relx=0, rely=0, relwidth=0, relheight=1)
+
+check_header = tk.Frame(capture_right, bg=CARD)
+check_header.pack(fill="x", pady=(4, 8))
+icon_label(check_header, "check", bg=CARD).pack(side="left", padx=(0, 8))
+tk.Label(check_header, text="Checklist", bg=CARD, fg=TEXT, font=("Arial", 18, "bold")).pack(side="left")
+
+checklist_frame = tk.Frame(capture_right, bg=CARD)
+checklist_frame.pack(fill="x")
+
+
+def make_check_item(name):
+    item = tk.Label(checklist_frame, text=f"[ ]   {name}", bg=SOFT, fg=TEXT, font=("Arial", 17, "bold"), anchor="w", padx=18, pady=16, relief="flat")
+    item.pack(fill="x", pady=5)
+    check_labels[name] = item
+
+
+make_check_item("TOA")
+make_check_item("TOB")
+make_check_item("TOC")
+
+step_status_box = tk.Frame(capture_right, bg=SOFT, padx=12, pady=10)
+step_status_box.pack(fill="x", pady=(16, 10))
+
+step_header = tk.Frame(step_status_box, bg=SOFT)
+step_header.pack(fill="x")
+icon_label(step_header, "setting", bg=SOFT).pack(side="left", padx=(0, 8))
+tk.Label(step_header, text="Step", bg=SOFT, fg="#34495e", font=("Arial", 14, "bold")).pack(side="left")
+
+step_label = tk.Label(step_status_box, text="-", bg=SOFT, fg=TEXT, font=("Arial", 14), wraplength=360, justify="left")
+step_label.pack(anchor="w", pady=(2, 8))
+
+status_detail_header = tk.Frame(step_status_box, bg=SOFT)
+status_detail_header.pack(fill="x")
+icon_label(status_detail_header, "info", bg=SOFT).pack(side="left", padx=(0, 8))
+tk.Label(status_detail_header, text="Status", bg=SOFT, fg="#34495e", font=("Arial", 14, "bold")).pack(side="left")
+
+status_label = tk.Label(step_status_box, text="-", bg=SOFT, fg=TEXT, font=("Arial", 14), wraplength=360, justify="left")
+status_label.pack(anchor="w", pady=(2, 0))
+
+# =========================================================
+# PAGE 3/5: RESULT
+# =========================================================
+page_result = tk.Frame(root, bg=BG)
+
+result_header = tk.Frame(page_result, bg=BG)
+result_header.pack(fill="x", padx=16, pady=(12, 8))
+
+result_left_header = tk.Frame(result_header, bg=BG)
+result_left_header.pack(side="left")
+
+result_title = tk.Label(result_left_header, text="OCR Result", font=("Arial", 28, "bold"), bg=BG, fg=TEXT)
+result_title.pack(side="left")
+
+result_status_badge = tk.Label(result_left_header, text="WAIT REVIEW", bg="#f1c40f", fg=TEXT, font=("Arial", 14, "bold"), padx=16, pady=7)
+result_status_badge.pack(side="left", padx=14)
+
+result_button_frame = tk.Frame(result_header, bg=BG)
+result_button_frame.pack(side="right")
+
+cancel_result_btn = add_action_button(result_button_frame, "Cancel Job", bg=RED, fg="white", command=cancel_job, width_px=205, height_px=58, frame_bg=BG)
+restart_result_btn = add_action_button(result_button_frame, "Restart The Process", bg="#bfc3c7", fg=TEXT, command=restart_process, width_px=205, height_px=58, frame_bg=BG)
+ok_next_btn = add_action_button(result_button_frame, "OK / NEXT", bg="#27ae60", fg="white", command=on_result_ok, width_px=205, height_px=58, frame_bg=BG)
+
+result_hint = tk.Label(page_result, text="Review ROI image and OCR result, then press OK / NEXT to continue.", bg=BG, fg=MUTED, font=("Arial", 14))
+result_hint.pack(anchor="w", padx=18, pady=(0, 10))
+
+product_result_area = tk.Frame(page_result, bg=BG)
+product_result_area.pack(fill="both", expand=True, padx=10, pady=(0, 12))
+
+make_product_result_section(product_result_area, key="vendor", title="RESULT : Vendor Label", icon_key="delivery", field1="BOX ID", value1="BOX ID :", field2="Date Code", value2="Date Code :")
+make_product_result_section(product_result_area, key="toa", title="RESULT : TOA Label", icon_key="barcode", field1="Lot No", value1="Lot No :", field2="Date Code", value2="Date Code :")
+make_product_result_section(product_result_area, key="tob", title="RESULT : TOB Label", icon_key="pack", field1="Lot No", value1="Lot No :", field2="Date Code", value2="Date Code :")
+
+toc_result_area = tk.Frame(page_result, bg=BG)
+
+# =========================================================
+# READY TOC
+# =========================================================
+page_ready_toc = tk.Frame(root, bg=BG)
+
+toc_card = tk.Frame(page_ready_toc, bg=CARD, padx=35, pady=35, highlightbackground=BORDER, highlightthickness=1)
+toc_card.place(relx=0.5, rely=0.45, anchor="center", width=560, height=300)
+
+tk.Label(toc_card, text="Inner Box Test Completed", font=("Arial", 21, "bold"), bg=CARD, fg=GREEN).pack(pady=15)
+tk.Label(toc_card, text="Press continue to test CAM3 Outer Box / TOC YOLO ROI OCR", font=("Arial", 13), bg=CARD, fg="#34495e", wraplength=460).pack(pady=8)
+tk.Button(toc_card, text="CONTINUE TO OUTER BOX", bg=BLUE, fg="white", font=("Arial", 14, "bold"), width=24, relief="flat", command=continue_toc).pack(pady=20)
+tk.Button(toc_card, text="CANCEL JOB", bg=RED, fg="white", font=("Arial", 12, "bold"), width=24, relief="flat", command=cancel_job).pack(pady=(0, 8))
+
+# =========================================================
+# COMPLETE
+# =========================================================
+page_complete = tk.Frame(root, bg=BG)
+
+complete_card = tk.Frame(page_complete, bg=CARD, padx=35, pady=35, highlightbackground=BORDER, highlightthickness=1)
+complete_card.place(relx=0.5, rely=0.45, anchor="center", width=520, height=260)
+
+tk.Label(complete_card, text="TEST COMPLETED", font=("Arial", 24, "bold"), bg=CARD, fg=GREEN).pack(pady=25)
+tk.Button(complete_card, text="OK", bg=BLUE, fg="white", font=("Arial", 14, "bold"), width=16, relief="flat", command=reset_to_input).pack(pady=10)
+
+# Debug page names
+page_input._debug_name = "page_input"
+page_capture._debug_name = "page_capture"
+page_result._debug_name = "page_result"
+page_ready_toc._debug_name = "page_ready_toc"
+page_complete._debug_name = "page_complete"
+
+root.protocol("WM_DELETE_WINDOW", on_close)
+show_page(page_input)
+root.mainloop()
