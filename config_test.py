@@ -12,7 +12,7 @@ OCR_DIR = os.path.join(OUTPUT_DIR, "ocr")
 # =====================
 PICAM1_INDEX = 1
 PICAM2_INDEX = 0
-USB_DEVICE = 17
+USB_DEVICE = 0
 
 PICAM_PREVIEW_SIZE = (640, 480)
 PICAM_CAPTURE_SIZE = (1280, 720)
